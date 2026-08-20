@@ -1,0 +1,34 @@
+name: TCR Daily Schedule Dispatcher
+
+on:
+  schedule:
+    # Runs daily at 8:00 AM IST (which is 2:30 AM UTC)
+    - cron: '30 12 * * *'
+  workflow_dispatch: # This adds a manual "Run" button for testing
+
+jobs:
+  run-whatsapp-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Execute WhatsApp Dispatcher
+        run: node index.js
+
+      - name: Save Updated WhatsApp Auth State
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add auth_info/
+          git commit -m "Auto-refresh WhatsApp Auth State" || echo "No changes to commit"
+          git push
