@@ -8,7 +8,7 @@ const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbzjhoxJDCZvDDre
 // 2. Map Center + Course to specific WhatsApp Group IDs
 // Ensure these IDs exactly match your WhatsApp groups (format: 1234567890-123456@g.us)
 const GROUP_DIRECTORY = {
-  'Hauz Khas_CLAT': '1234567890-111111@g.us',
+  'Hauz Khas_CLAT': '917042777086@s.whatsapp.net',
   'Hauz Khas_CUET': '1234567890-222222@g.us',
   'Laxmi Nagar_CLAT': '1234567890-333333@g.us',
   'Laxmi Nagar_CUET': '1234567890-444444@g.us',
