@@ -70,7 +70,7 @@ async function processDailySchedules(sock) {
     const tomMonth = istTomorrow.getMonth();
     const tomDate = istTomorrow.getDate();
 
-  const tomorrowsClasses = allClasses.filter(item => {
+    const tomorrowsClasses = allClasses.filter(item => {
       const rawDateUTC = new Date(item.date);
       if (isNaN(rawDateUTC)) return false;
       
@@ -103,20 +103,41 @@ async function processDailySchedules(sock) {
       groupedClasses[key].sessions.push(item);
     }
 
+    // --- Helper function for date formatting (st, nd, rd, th) ---
+    function getOrdinalSuffix(d) {
+      if (d > 3 && d < 21) return 'th';
+      switch (d % 10) {
+        case 1:  return "st";
+        case 2:  return "nd";
+        case 3:  return "rd";
+        default: return "th";
+      }
+    }
+
     for (const key in groupedClasses) {
       const group = groupedClasses[key];
-      // Fetch dynamic ID from the Apps Script settings payload
       const groupId = groupDirectory[key];
 
       if (groupId) {
+        // 1. Grab the raw date and fix the timezone to IST
+        const rawDate = new Date(group.date);
+        const istDate = new Date(rawDate.getTime() + (5.5 * 60 * 60 * 1000));
+        
+        // 2. Format to "22nd August"
+        const day = istDate.getDate();
+        const month = istDate.toLocaleString('en-US', { month: 'long' });
+        const formattedDate = `${day}${getOrdinalSuffix(day)} ${month}`;
+
+        // 3. Build the message matching the exact spacing of the screenshot
         let message = `*TCR – ${group.course.toUpperCase()} CLASS FLOW*\n\n` +
-                      `*Class Schedule*\n\n` +
-                      `📌 ${group.date}\n\n`;
+                      `*Class Schedule*\n` +
+                      `📌 ${formattedDate}\n\n`;
 
         for (const session of group.sessions) {
-          message += `${session.time}\n` +
+          // Time is now bolded, Faculty is forced to uppercase
+          message += `*${session.time}*\n` +
                      `Subject: *${session.subject}*\n` +
-                     `Faculty: *${session.faculty}*\n\n`;
+                     `Faculty: *${session.faculty.toUpperCase()}*\n\n`;
         }
 
         message += `Regards,\n*TEAM TCR*`;
@@ -124,6 +145,7 @@ async function processDailySchedules(sock) {
         await sock.sendMessage(groupId, { text: message });
         console.log(`Sent bundled schedule for ${key}`);
 
+        // Mark these specific rows as SENT in the Google Sheet
         for (const session of group.sessions) {
           await axios.post(APPS_SCRIPT_URL, { rowIndex: session.rowIndex });
         }
