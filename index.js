@@ -70,12 +70,16 @@ async function processDailySchedules(sock) {
     const tomMonth = istTomorrow.getMonth();
     const tomDate = istTomorrow.getDate();
 
-    const tomorrowsClasses = allClasses.filter(item => {
-      const rowDate = new Date(item.date);
-      if (isNaN(rowDate)) return false;
-      return rowDate.getFullYear() === tomYear &&
-             rowDate.getMonth() === tomMonth &&
-             rowDate.getDate() === tomDate;
+  const tomorrowsClasses = allClasses.filter(item => {
+      const rawDateUTC = new Date(item.date);
+      if (isNaN(rawDateUTC)) return false;
+      
+      // Shift the Google Sheet date explicitly back into IST (+5:30)
+      const rowDateIST = new Date(rawDateUTC.getTime() + (5.5 * 60 * 60 * 1000));
+      
+      return rowDateIST.getFullYear() === tomYear &&
+             rowDateIST.getMonth() === tomMonth &&
+             rowDateIST.getDate() === tomDate;
     });
 
     if (tomorrowsClasses.length === 0) {
