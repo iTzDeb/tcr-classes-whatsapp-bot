@@ -4,6 +4,71 @@ import axios from 'axios';
 
 const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbzjhoxJDCZvDDre0v1-4Pfpe7y4F4VR7Pw6EtFeNCZIXqwu_Q5FDKf4Vg9FDnFXXWMUlg/exec';
 
+// Zoom Environment Variables
+const ZOOM_ACCOUNT_ID = process.env.ZOOM_ACCOUNT_ID;
+const ZOOM_CLIENT_ID = process.env.ZOOM_CLIENT_ID;
+const ZOOM_CLIENT_SECRET = process.env.ZOOM_CLIENT_SECRET;
+
+async function getZoomAccessToken() {
+  if (!ZOOM_ACCOUNT_ID || !ZOOM_CLIENT_ID || !ZOOM_CLIENT_SECRET) {
+      console.warn("Zoom credentials missing! Proceeding without Zoom links.");
+      return null;
+  }
+  
+  const authHeader = Buffer.from(`${ZOOM_CLIENT_ID}:${ZOOM_CLIENT_SECRET}`).toString('base64');
+  
+  try {
+    const response = await axios.post(
+      `https://zoom.us/oauth/token?grant_type=account_credentials&account_id=${ZOOM_ACCOUNT_ID}`, 
+      {}, 
+      {
+        headers: {
+          'Authorization': `Basic ${authHeader}`,
+          'Content-Type': 'application/x-www-form-urlencoded'
+        }
+      }
+    );
+    return response.data.access_token;
+  } catch (e) {
+    console.error("Failed to fetch Zoom Token:", e?.response?.data || e.message);
+    return null;
+  }
+}
+
+async function createZoomMeeting(accessToken, topic, startTime, durationMins) {
+  try {
+    const payload = {
+      topic: topic,
+      type: 2, 
+      start_time: startTime,
+      duration: durationMins,
+      timezone: 'Asia/Kolkata',
+      settings: {
+        host_video: true,
+        participant_video: false,
+        join_before_host: false,
+        mute_upon_entry: true,
+        waiting_room: true
+      }
+    };
+
+    const response = await axios.post(
+      'https://api.zoom.us/v2/users/me/meetings',
+      payload,
+      {
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    return response.data.join_url;
+  } catch (e) {
+    console.error(`Failed to create meeting for ${topic}:`, e?.response?.data || e.message);
+    return null;
+  }
+}
+
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info');
   
@@ -15,34 +80,21 @@ async function startBot() {
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', async (update) => {
-    const { connection, qr, lastDisconnect } = update;
+    const { connection, lastDisconnect } = update;
     
-    if (qr) {
-      qrcode.generate(qr, { small: true });
-    }
-
     if (connection === 'close') {
       const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
       console.log('Connection closed. Reconnecting:', shouldReconnect);
       if (shouldReconnect) startBot();
     } else if (connection === 'open') {
-      console.log('Connected to WhatsApp Web!');
-      
-      // --- SILENTLY FETCH AND LOG ALL GROUP IDs ---
-      const groups = await sock.groupFetchAllParticipating();
-      console.log('\n--- YOUR WHATSAPP GROUP IDs ---');
-      for (const id in groups) {
-          console.log(`Group Name: ${groups[id].subject} | ID: ${id}`);
-      }
-      console.log('-------------------------------\n');
-
-      console.log('Processing tomorrow\'s schedules...');
+      console.log('Connected to WhatsApp Web! Processing tomorrow\'s schedules...');
       await processDailySchedules(sock);
       
+      // FIX: Increased to 20 seconds to allow E2EE history to sync to your phone
       setTimeout(() => {
           console.log('Finished sending messages. Shutting down process.');
           process.exit(0);
-      }, 5000); 
+      }, 20000); 
     }
   });
 }
@@ -51,7 +103,6 @@ async function processDailySchedules(sock) {
   try {
     const res = await axios.get(APPS_SCRIPT_URL);
     
-    // Deconstruct the response expecting both classes and settings
     const allClasses = res.data.classes;
     const groupDirectory = res.data.settings; 
 
@@ -73,10 +124,7 @@ async function processDailySchedules(sock) {
     const tomorrowsClasses = allClasses.filter(item => {
       const rawDateUTC = new Date(item.date);
       if (isNaN(rawDateUTC)) return false;
-      
-      // Shift the Google Sheet date explicitly back into IST (+5:30)
       const rowDateIST = new Date(rawDateUTC.getTime() + (5.5 * 60 * 60 * 1000));
-      
       return rowDateIST.getFullYear() === tomYear &&
              rowDateIST.getMonth() === tomMonth &&
              rowDateIST.getDate() === tomDate;
@@ -88,64 +136,62 @@ async function processDailySchedules(sock) {
     }
 
     const groupedClasses = {};
-    
     for (const item of tomorrowsClasses) {
       const key = `${item.center}_${item.course}`; 
-      
       if (!groupedClasses[key]) {
-        groupedClasses[key] = {
-          date: item.date, 
-          course: item.course,
-          center: item.center,
-          sessions: []
-        };
+        groupedClasses[key] = { date: item.date, course: item.course, center: item.center, sessions: [] };
       }
       groupedClasses[key].sessions.push(item);
     }
 
-    // --- Helper function for date formatting (st, nd, rd, th) ---
     function getOrdinalSuffix(d) {
       if (d > 3 && d < 21) return 'th';
       switch (d % 10) {
-        case 1:  return "st";
-        case 2:  return "nd";
-        case 3:  return "rd";
-        default: return "th";
+        case 1: return "st"; case 2: return "nd"; case 3: return "rd"; default: return "th";
       }
     }
+
+    const zoomToken = await getZoomAccessToken();
 
     for (const key in groupedClasses) {
       const group = groupedClasses[key];
       const groupId = groupDirectory[key];
 
       if (groupId) {
-        // 1. Grab the raw date and fix the timezone to IST
         const rawDate = new Date(group.date);
         const istDate = new Date(rawDate.getTime() + (5.5 * 60 * 60 * 1000));
         
-        // 2. Format to "22nd August"
         const day = istDate.getDate();
         const month = istDate.toLocaleString('en-US', { month: 'long' });
         const formattedDate = `${day}${getOrdinalSuffix(day)} ${month}`;
 
-        // 3. Build the message matching the exact spacing of the screenshot
         let message = `*TCR – ${group.course.toUpperCase()} CLASS FLOW*\n\n` +
                       `*Class Schedule*\n` +
                       `📌 ${formattedDate}\n\n`;
 
         for (const session of group.sessions) {
-          // Time is now bolded, Faculty is forced to uppercase
           message += `*${session.time}*\n` +
                      `Subject: *${session.subject}*\n` +
-                     `Faculty: *${session.faculty.toUpperCase()}*\n\n`;
+                     `Faculty: *${session.faculty.toUpperCase()}*\n`;
+          
+          const subjectLower = session.subject.toLowerCase();
+          const isOfflineEvent = subjectLower.includes('mock') || subjectLower.includes('test');
+                     
+          if (zoomToken && session.zoomStart && !isOfflineEvent) {
+             const meetingTitle = `TCR ${session.course} - ${session.subject} (${session.faculty})`;
+             const joinUrl = await createZoomMeeting(zoomToken, meetingTitle, session.zoomStart, session.zoomDuration);
+             if (joinUrl) {
+                message += `🔗 *Zoom:* ${joinUrl}\n`;
+             }
+          }
+          message += `\n`; 
         }
 
         message += `Regards,\n*TEAM TCR*`;
 
-        await sock.sendMessage(groupId, { text: message });
+        await sock.sendMessage(groupId, { text: message.trim() });
         console.log(`Sent bundled schedule for ${key}`);
 
-        // Mark these specific rows as SENT in the Google Sheet
         for (const session of group.sessions) {
           await axios.post(APPS_SCRIPT_URL, { rowIndex: session.rowIndex });
         }
