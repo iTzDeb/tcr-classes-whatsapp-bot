@@ -153,6 +153,9 @@ async function processDailySchedules(sock) {
 
     const zoomToken = await getZoomAccessToken();
 
+    // Helper to pause execution
+    const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
     for (const key in groupedClasses) {
       const group = groupedClasses[key];
       const groupId = groupDirectory[key];
@@ -191,6 +194,9 @@ async function processDailySchedules(sock) {
 
         await sock.sendMessage(groupId, { text: message.trim() });
         console.log(`Sent bundled schedule for ${key}`);
+
+        // FIX: Pause for 5 seconds to ensure WhatsApp encryption keys sync fully
+        await delay(5000);
 
         for (const session of group.sessions) {
           await axios.post(APPS_SCRIPT_URL, { rowIndex: session.rowIndex });
