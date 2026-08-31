@@ -1,14 +1,12 @@
 name: TCR Daily Schedule Dispatcher
 
 on:
-  schedule:
-    # Runs daily at 8:00 AM IST (which is 2:30 AM UTC)
-    - cron: '30 12 * * *'
-  workflow_dispatch: # This adds a manual "Run" button for testing
+  workflow_dispatch: # This allows Google Apps Script to trigger it remotely
 
 jobs:
   run-whatsapp-bot:
     runs-on: ubuntu-latest
+# ... [Keep the rest of your file exactly the same from here down] ...
 
     steps:
       - name: Checkout Code
