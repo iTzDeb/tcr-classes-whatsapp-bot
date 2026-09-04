@@ -40,7 +40,7 @@ async function createZoomMeeting(accessToken, topic, startTime, durationMins) {
     const payload = {
       topic: topic,
       type: 2, 
-      start_time: startTime, // MUST be YYYY-MM-DDTHH:MM:SS with no 'Z'
+      start_time: startTime, 
       duration: durationMins,
       timezone: 'Asia/Kolkata',
       settings: {
@@ -98,51 +98,44 @@ async function startBot() {
   });
 }
 
-// --- NEW: Smart Indian Time Parser for Zoom ---
 function formatZoomStartTime(dateStr, timeStr) {
   try {
-    // 1. Shift date strictly to IST
     const rawDate = new Date(dateStr);
     const istDate = new Date(rawDate.getTime() + (5.5 * 60 * 60 * 1000));
     const yyyy = istDate.getFullYear();
     const mm = String(istDate.getMonth() + 1).padStart(2, '0');
     const dd = String(istDate.getDate()).padStart(2, '0');
 
-    // 2. Parse the time string (e.g., "11:00 - 12:30PM")
     const parts = String(timeStr).toUpperCase().split('-');
     let startStr = parts[0].trim();
     let endStr = parts[1] ? parts[1].trim() : '';
 
-    let startMatch = startStr.match(/(\d+):(\d+)/);
+    let startMatch = startStr.match(/(\d+)(?::(\d+))?/);
     if (!startMatch) return null;
     let startHours = parseInt(startMatch[1], 10);
-    let startMins = parseInt(startMatch[2], 10);
+    let startMins = startMatch[2] ? parseInt(startMatch[2], 10) : 0;
 
     let startAmPm = startStr.includes('PM') ? 'PM' : (startStr.includes('AM') ? 'AM' : null);
     let endAmPm = endStr.includes('PM') ? 'PM' : (endStr.includes('AM') ? 'AM' : null);
 
-    // 3. Smart AM/PM Inheritance
     if (!startAmPm) {
        if (endAmPm === 'PM') {
-          // If a class starts at 7, 8, 9, 10, or 11, it is an AM class (e.g. 11:00 - 12:30PM)
           if (startHours >= 7 && startHours <= 11) {
              startAmPm = 'AM';
           } else {
-             startAmPm = 'PM'; // e.g. 3:00 - 5:00PM
+             startAmPm = 'PM'; 
           }
        } else {
-          startAmPm = 'AM'; // Fallback
+          startAmPm = 'AM'; 
        }
     }
 
-    // 4. Convert to 24-hour format
     if (startAmPm === 'PM' && startHours !== 12) startHours += 12;
     if (startAmPm === 'AM' && startHours === 12) startHours = 0;
 
     const hh = String(startHours).padStart(2, '0');
     const min = String(startMins).padStart(2, '0');
 
-    // 5. Output EXACT format Zoom requires: YYYY-MM-DDTHH:MM:SS
     return `${yyyy}-${mm}-${dd}T${hh}:${min}:00`;
   } catch (e) {
     return null;
@@ -202,6 +195,8 @@ async function processDailySchedules(sock) {
 
     const zoomToken = await getZoomAccessToken();
     const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    
+    let zoomCollisionOffset = 1;
 
     for (const key in groupedClasses) {
       const group = groupedClasses[key];
@@ -228,12 +223,25 @@ async function processDailySchedules(sock) {
           const isOfflineEvent = subjectLower.includes('mock') || subjectLower.includes('test');
                      
           if (zoomToken && !isOfflineEvent) {
-             const exactZoomStartTime = formatZoomStartTime(group.date, session.time);
-             const meetingTitle = `TCR ${session.course} - ${session.subject} (${session.faculty})`;
-             const duration = session.zoomDuration || 120; // Fallback to 2 hours if missing
+             let exactZoomStartTime = formatZoomStartTime(group.date, session.time);
+             const duration = session.zoomDuration || 120;
              
              if (exactZoomStartTime) {
-                 const joinUrl = await createZoomMeeting(zoomToken, meetingTitle, exactZoomStartTime, duration);
+                 const meetingTitle = `TCR ${group.center} ${session.course} - ${session.subject} (${session.faculty})`;
+
+                 const secondOffset = String(zoomCollisionOffset % 60).padStart(2, '0');
+                 exactZoomStartTime = exactZoomStartTime.substring(0, 17) + secondOffset;
+                 zoomCollisionOffset++;
+
+                 await delay(1000); 
+                 let joinUrl = await createZoomMeeting(zoomToken, meetingTitle, exactZoomStartTime, duration);
+                 
+                 if (!joinUrl) {
+                     console.log(`Retrying Zoom link for ${meetingTitle}...`);
+                     await delay(2000);
+                     joinUrl = await createZoomMeeting(zoomToken, meetingTitle, exactZoomStartTime, duration);
+                 }
+
                  if (joinUrl) {
                     message += `🔗 *Zoom:* ${joinUrl}\n`;
                  }
@@ -247,7 +255,7 @@ async function processDailySchedules(sock) {
         await sock.sendMessage(groupId, { text: message.trim() });
         console.log(`Sent bundled schedule for ${key}`);
 
-        await delay(5000); // 5-second encryption sync buffer
+        await delay(5000); 
 
         for (const session of group.sessions) {
           await axios.post(APPS_SCRIPT_URL, { rowIndex: session.rowIndex });
