@@ -2,24 +2,96 @@ import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeys
 import qrcode from 'qrcode-terminal';
 import axios from 'axios';
 
-const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbzjhoxJDCZvDDre0v1-4Pfpe7y4F4VR7Pw6EtFeNCZIXqwu_Q5FDKf4Vg9FDnFXXWMUlg/exec';
+// ============================================================================
+// 1. GLOBAL CONFIGURATION (Your Control Panel)
+// ============================================================================
+const CONFIG = {
+  APPS_SCRIPT_URL: 'https://script.google.com/macros/s/AKfycbzjhoxJDCZvDDre0v1-4Pfpe7y4F4VR7Pw6EtFeNCZIXqwu_Q5FDKf4Vg9FDnFXXWMUlg/exec',
+  
+  ZOOM: {
+    ACCOUNT_ID: process.env.ZOOM_ACCOUNT_ID,
+    CLIENT_ID: process.env.ZOOM_CLIENT_ID,
+    CLIENT_SECRET: process.env.ZOOM_CLIENT_SECRET,
+    // Add new centers here in lowercase to enable Zoom link generation
+    CENTERS_REQUIRING_ZOOM: ['laxmi nagar'],
+    DEFAULT_DURATION_MINS: 120
+  },
 
-// Zoom Environment Variables
-const ZOOM_ACCOUNT_ID = process.env.ZOOM_ACCOUNT_ID;
-const ZOOM_CLIENT_ID = process.env.ZOOM_CLIENT_ID;
-const ZOOM_CLIENT_SECRET = process.env.ZOOM_CLIENT_SECRET;
+  TIMINGS: {
+    MESSAGE_DELAY_MS: 5000,    // E2EE sync buffer between messages
+    SHUTDOWN_DELAY_MS: 20000,  // E2EE sync buffer before turning off
+    API_BREATHER_MS: 1000,     // Prevents hitting Zoom rate limits
+    ZOOM_RETRY_MS: 2000        // Wait time if Zoom API glitches
+  }
+};
 
+// ============================================================================
+// 2. HELPER FUNCTIONS
+// ============================================================================
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function getOrdinalSuffix(d) {
+  if (d > 3 && d < 21) return 'th';
+  switch (d % 10) {
+    case 1: return "st"; case 2: return "nd"; case 3: return "rd"; default: return "th";
+  }
+}
+
+function formatZoomStartTime(dateStr, timeStr) {
+  try {
+    const rawDate = new Date(dateStr);
+    const istDate = new Date(rawDate.getTime() + (5.5 * 60 * 60 * 1000));
+    const yyyy = istDate.getFullYear();
+    const mm = String(istDate.getMonth() + 1).padStart(2, '0');
+    const dd = String(istDate.getDate()).padStart(2, '0');
+
+    const parts = String(timeStr).toUpperCase().split('-');
+    let startStr = parts[0].trim();
+    let endStr = parts[1] ? parts[1].trim() : '';
+
+    let startMatch = startStr.match(/(\d+)(?::(\d+))?/);
+    if (!startMatch) return null;
+    let startHours = parseInt(startMatch[1], 10);
+    let startMins = startMatch[2] ? parseInt(startMatch[2], 10) : 0;
+
+    let startAmPm = startStr.includes('PM') ? 'PM' : (startStr.includes('AM') ? 'AM' : null);
+    let endAmPm = endStr.includes('PM') ? 'PM' : (endStr.includes('AM') ? 'AM' : null);
+
+    if (!startAmPm) {
+       if (endAmPm === 'PM') {
+          if (startHours >= 7 && startHours <= 11) startAmPm = 'AM';
+          else startAmPm = 'PM'; 
+       } else {
+          startAmPm = 'AM'; 
+       }
+    }
+
+    if (startAmPm === 'PM' && startHours !== 12) startHours += 12;
+    if (startAmPm === 'AM' && startHours === 12) startHours = 0;
+
+    const hh = String(startHours).padStart(2, '0');
+    const min = String(startMins).padStart(2, '0');
+
+    return `${yyyy}-${mm}-${dd}T${hh}:${min}:00`;
+  } catch (e) {
+    return null;
+  }
+}
+
+// ============================================================================
+// 3. ZOOM API SERVICES
+// ============================================================================
 async function getZoomAccessToken() {
-  if (!ZOOM_ACCOUNT_ID || !ZOOM_CLIENT_ID || !ZOOM_CLIENT_SECRET) {
+  if (!CONFIG.ZOOM.ACCOUNT_ID || !CONFIG.ZOOM.CLIENT_ID || !CONFIG.ZOOM.CLIENT_SECRET) {
       console.warn("Zoom credentials missing! Proceeding without Zoom links.");
       return null;
   }
   
-  const authHeader = Buffer.from(`${ZOOM_CLIENT_ID}:${ZOOM_CLIENT_SECRET}`).toString('base64');
+  const authHeader = Buffer.from(`${CONFIG.ZOOM.CLIENT_ID}:${CONFIG.ZOOM.CLIENT_SECRET}`).toString('base64');
   
   try {
     const response = await axios.post(
-      `https://zoom.us/oauth/token?grant_type=account_credentials&account_id=${ZOOM_ACCOUNT_ID}`, 
+      `https://zoom.us/oauth/token?grant_type=account_credentials&account_id=${CONFIG.ZOOM.ACCOUNT_ID}`, 
       {}, 
       {
         headers: {
@@ -69,6 +141,139 @@ async function createZoomMeeting(accessToken, topic, startTime, durationMins) {
   }
 }
 
+// ============================================================================
+// 4. CORE DATA PROCESSING
+// ============================================================================
+async function processDailySchedules(sock) {
+  try {
+    const res = await axios.get(CONFIG.APPS_SCRIPT_URL);
+    const allClasses = res.data.classes;
+    const groupDirectory = res.data.settings; 
+
+    if (!allClasses || allClasses.length === 0) {
+      console.log('No pending classes found in the sheet.');
+      return;
+    }
+
+    // Filter for tomorrow's classes in IST
+    const currentUTC = new Date();
+    const istNow = new Date(currentUTC.getTime() + (5.5 * 60 * 60 * 1000));
+    const istTomorrow = new Date(istNow);
+    istTomorrow.setDate(istTomorrow.getDate() + 1);
+    
+    const tomYear = istTomorrow.getFullYear();
+    const tomMonth = istTomorrow.getMonth();
+    const tomDate = istTomorrow.getDate();
+
+    const tomorrowsClasses = allClasses.filter(item => {
+      const rawDateUTC = new Date(item.date);
+      if (isNaN(rawDateUTC)) return false;
+      const rowDateIST = new Date(rawDateUTC.getTime() + (5.5 * 60 * 60 * 1000));
+      return rowDateIST.getFullYear() === tomYear &&
+             rowDateIST.getMonth() === tomMonth &&
+             rowDateIST.getDate() === tomDate;
+    });
+
+    if (tomorrowsClasses.length === 0) {
+      console.log('No classes scheduled for tomorrow.');
+      return;
+    }
+
+    // Group by Center and Course
+    const groupedClasses = {};
+    for (const item of tomorrowsClasses) {
+      const key = `${item.center}_${item.course}`; 
+      if (!groupedClasses[key]) {
+        groupedClasses[key] = { date: item.date, course: item.course, center: item.center, sessions: [] };
+      }
+      groupedClasses[key].sessions.push(item);
+    }
+
+    const zoomToken = await getZoomAccessToken();
+    let zoomCollisionOffset = 1;
+
+    // Dispatch messages
+    for (const key in groupedClasses) {
+      const group = groupedClasses[key];
+      const groupId = groupDirectory[key];
+
+      if (!groupId) {
+        console.log(`No group ID routing found in Settings tab for: ${key}`);
+        continue;
+      }
+
+      const rawDate = new Date(group.date);
+      const istDate = new Date(rawDate.getTime() + (5.5 * 60 * 60 * 1000));
+      const day = istDate.getDate();
+      const month = istDate.toLocaleString('en-US', { month: 'long' });
+      const formattedDate = `${day}${getOrdinalSuffix(day)} ${month}`;
+
+      let message = `*TCR – ${group.course.toUpperCase()} CLASS FLOW*\n\n` +
+                    `*Class Schedule*\n` +
+                    `📌 ${formattedDate}\n\n`;
+
+      // Check if this specific center is approved for Zoom Links
+      const centerNormalized = group.center.toLowerCase().trim();
+      const centerRequiresZoom = CONFIG.ZOOM.CENTERS_REQUIRING_ZOOM.includes(centerNormalized);
+
+      for (const session of group.sessions) {
+        message += `*${session.time}*\n` +
+                   `Subject: *${session.subject}*\n` +
+                   `Faculty: *${session.faculty.toUpperCase()}*\n`;
+        
+        const subjectLower = session.subject.toLowerCase();
+        const isOfflineEvent = subjectLower.includes('mock') || subjectLower.includes('test');
+                   
+        if (zoomToken && centerRequiresZoom && !isOfflineEvent) {
+           let exactZoomStartTime = formatZoomStartTime(group.date, session.time);
+           const duration = session.zoomDuration || CONFIG.ZOOM.DEFAULT_DURATION_MINS;
+           
+           if (exactZoomStartTime) {
+               const meetingTitle = `TCR ${group.center} ${session.course} - ${session.subject} (${session.faculty})`;
+
+               // Collision offset
+               const secondOffset = String(zoomCollisionOffset % 60).padStart(2, '0');
+               exactZoomStartTime = exactZoomStartTime.substring(0, 17) + secondOffset;
+               zoomCollisionOffset++;
+
+               await delay(CONFIG.TIMINGS.API_BREATHER_MS); 
+               let joinUrl = await createZoomMeeting(zoomToken, meetingTitle, exactZoomStartTime, duration);
+               
+               if (!joinUrl) {
+                   console.log(`Retrying Zoom link for ${meetingTitle}...`);
+                   await delay(CONFIG.TIMINGS.ZOOM_RETRY_MS);
+                   joinUrl = await createZoomMeeting(zoomToken, meetingTitle, exactZoomStartTime, duration);
+               }
+
+               if (joinUrl) {
+                  message += `🔗 *Zoom:* ${joinUrl}\n`;
+               }
+           }
+        }
+        message += `\n`; 
+      }
+
+      message += `Regards,\n*TEAM TCR*`;
+
+      // Send via WhatsApp
+      await sock.sendMessage(groupId, { text: message.trim() });
+      console.log(`Sent bundled schedule for ${key}`);
+
+      await delay(CONFIG.TIMINGS.MESSAGE_DELAY_MS); 
+
+      // Mark as Sent in Google Sheet
+      for (const session of group.sessions) {
+        await axios.post(CONFIG.APPS_SCRIPT_URL, { rowIndex: session.rowIndex });
+      }
+    }
+  } catch (err) {
+    console.error('Error processing schedule:', err.message);
+  }
+}
+
+// ============================================================================
+// 5. WHATSAPP CONNECTION & INITIALIZATION
+// ============================================================================
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info');
   
@@ -93,180 +298,10 @@ async function startBot() {
       setTimeout(() => {
           console.log('Finished sending messages. Shutting down process.');
           process.exit(0);
-      }, 20000); 
+      }, CONFIG.TIMINGS.SHUTDOWN_DELAY_MS); 
     }
   });
 }
 
-function formatZoomStartTime(dateStr, timeStr) {
-  try {
-    const rawDate = new Date(dateStr);
-    const istDate = new Date(rawDate.getTime() + (5.5 * 60 * 60 * 1000));
-    const yyyy = istDate.getFullYear();
-    const mm = String(istDate.getMonth() + 1).padStart(2, '0');
-    const dd = String(istDate.getDate()).padStart(2, '0');
-
-    const parts = String(timeStr).toUpperCase().split('-');
-    let startStr = parts[0].trim();
-    let endStr = parts[1] ? parts[1].trim() : '';
-
-    let startMatch = startStr.match(/(\d+)(?::(\d+))?/);
-    if (!startMatch) return null;
-    let startHours = parseInt(startMatch[1], 10);
-    let startMins = startMatch[2] ? parseInt(startMatch[2], 10) : 0;
-
-    let startAmPm = startStr.includes('PM') ? 'PM' : (startStr.includes('AM') ? 'AM' : null);
-    let endAmPm = endStr.includes('PM') ? 'PM' : (endStr.includes('AM') ? 'AM' : null);
-
-    if (!startAmPm) {
-       if (endAmPm === 'PM') {
-          if (startHours >= 7 && startHours <= 11) {
-             startAmPm = 'AM';
-          } else {
-             startAmPm = 'PM'; 
-          }
-       } else {
-          startAmPm = 'AM'; 
-       }
-    }
-
-    if (startAmPm === 'PM' && startHours !== 12) startHours += 12;
-    if (startAmPm === 'AM' && startHours === 12) startHours = 0;
-
-    const hh = String(startHours).padStart(2, '0');
-    const min = String(startMins).padStart(2, '0');
-
-    return `${yyyy}-${mm}-${dd}T${hh}:${min}:00`;
-  } catch (e) {
-    return null;
-  }
-}
-
-async function processDailySchedules(sock) {
-  try {
-    const res = await axios.get(APPS_SCRIPT_URL);
-    const allClasses = res.data.classes;
-    const groupDirectory = res.data.settings; 
-
-    if (!allClasses || allClasses.length === 0) {
-      console.log('No pending classes found in the sheet.');
-      return;
-    }
-
-    const currentUTC = new Date();
-    const istNow = new Date(currentUTC.getTime() + (5.5 * 60 * 60 * 1000));
-    
-    const istTomorrow = new Date(istNow);
-    istTomorrow.setDate(istTomorrow.getDate() + 1);
-    
-    const tomYear = istTomorrow.getFullYear();
-    const tomMonth = istTomorrow.getMonth();
-    const tomDate = istTomorrow.getDate();
-
-    const tomorrowsClasses = allClasses.filter(item => {
-      const rawDateUTC = new Date(item.date);
-      if (isNaN(rawDateUTC)) return false;
-      const rowDateIST = new Date(rawDateUTC.getTime() + (5.5 * 60 * 60 * 1000));
-      return rowDateIST.getFullYear() === tomYear &&
-             rowDateIST.getMonth() === tomMonth &&
-             rowDateIST.getDate() === tomDate;
-    });
-
-    if (tomorrowsClasses.length === 0) {
-      console.log('No classes scheduled for tomorrow.');
-      return;
-    }
-
-    const groupedClasses = {};
-    for (const item of tomorrowsClasses) {
-      const key = `${item.center}_${item.course}`; 
-      if (!groupedClasses[key]) {
-        groupedClasses[key] = { date: item.date, course: item.course, center: item.center, sessions: [] };
-      }
-      groupedClasses[key].sessions.push(item);
-    }
-
-    function getOrdinalSuffix(d) {
-      if (d > 3 && d < 21) return 'th';
-      switch (d % 10) {
-        case 1: return "st"; case 2: return "nd"; case 3: return "rd"; default: return "th";
-      }
-    }
-
-    const zoomToken = await getZoomAccessToken();
-    const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-    
-    let zoomCollisionOffset = 1;
-
-    for (const key in groupedClasses) {
-      const group = groupedClasses[key];
-      const groupId = groupDirectory[key];
-
-      if (groupId) {
-        const rawDate = new Date(group.date);
-        const istDate = new Date(rawDate.getTime() + (5.5 * 60 * 60 * 1000));
-        
-        const day = istDate.getDate();
-        const month = istDate.toLocaleString('en-US', { month: 'long' });
-        const formattedDate = `${day}${getOrdinalSuffix(day)} ${month}`;
-
-        let message = `*TCR – ${group.course.toUpperCase()} CLASS FLOW*\n\n` +
-                      `*Class Schedule*\n` +
-                      `📌 ${formattedDate}\n\n`;
-
-        for (const session of group.sessions) {
-          message += `*${session.time}*\n` +
-                     `Subject: *${session.subject}*\n` +
-                     `Faculty: *${session.faculty.toUpperCase()}*\n`;
-          
-          const subjectLower = session.subject.toLowerCase();
-          const isOfflineEvent = subjectLower.includes('mock') || subjectLower.includes('test');
-                     
-          if (zoomToken && !isOfflineEvent) {
-             let exactZoomStartTime = formatZoomStartTime(group.date, session.time);
-             const duration = session.zoomDuration || 120;
-             
-             if (exactZoomStartTime) {
-                 const meetingTitle = `TCR ${group.center} ${session.course} - ${session.subject} (${session.faculty})`;
-
-                 const secondOffset = String(zoomCollisionOffset % 60).padStart(2, '0');
-                 exactZoomStartTime = exactZoomStartTime.substring(0, 17) + secondOffset;
-                 zoomCollisionOffset++;
-
-                 await delay(1000); 
-                 let joinUrl = await createZoomMeeting(zoomToken, meetingTitle, exactZoomStartTime, duration);
-                 
-                 if (!joinUrl) {
-                     console.log(`Retrying Zoom link for ${meetingTitle}...`);
-                     await delay(2000);
-                     joinUrl = await createZoomMeeting(zoomToken, meetingTitle, exactZoomStartTime, duration);
-                 }
-
-                 if (joinUrl) {
-                    message += `🔗 *Zoom:* ${joinUrl}\n`;
-                 }
-             }
-          }
-          message += `\n`; 
-        }
-
-        message += `Regards,\n*TEAM TCR*`;
-
-        await sock.sendMessage(groupId, { text: message.trim() });
-        console.log(`Sent bundled schedule for ${key}`);
-
-        await delay(5000); 
-
-        for (const session of group.sessions) {
-          await axios.post(APPS_SCRIPT_URL, { rowIndex: session.rowIndex });
-        }
-      } else {
-        console.log(`No group ID routing found in Settings tab for: ${key}`);
-      }
-    }
-  } catch (err) {
-    console.error('Error processing schedule:', err.message);
-  }
-}
-
+// Launch the application
 startBot();
