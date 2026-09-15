@@ -255,13 +255,21 @@ async function processDailySchedules(sock) {
 
       message += `Regards,\n*TEAM TCR*`;
 
-      // Send via WhatsApp
-      await sock.sendMessage(groupId, { text: message.trim() });
-      console.log(`Sent bundled schedule for ${key}`);
+      // NEW: Split the Google Sheet cell by commas to support multiple groups!
+      const groupIdsArray = groupId.split(',').map(id => id.trim());
 
-      await delay(CONFIG.TIMINGS.MESSAGE_DELAY_MS); 
+      // Loop through every ID and send the message
+      for (const singleGroupId of groupIdsArray) {
+          if (singleGroupId) {
+              await sock.sendMessage(singleGroupId, { text: message.trim() });
+              console.log(`Sent bundled schedule for ${key} to group ${singleGroupId}`);
+              
+              // Pause between each group so WhatsApp doesn't block you for spamming
+              await delay(CONFIG.TIMINGS.MESSAGE_DELAY_MS); 
+          }
+      }
 
-      // Mark as Sent in Google Sheet
+      // Mark as Sent in Google Sheet ONCE after all groups have received it
       for (const session of group.sessions) {
         await axios.post(CONFIG.APPS_SCRIPT_URL, { rowIndex: session.rowIndex });
       }
