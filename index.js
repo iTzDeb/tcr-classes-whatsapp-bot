@@ -118,9 +118,9 @@ async function createZoomMeeting(accessToken, topic, startTime, durationMins) {
       settings: {
         host_video: true,
         participant_video: false,
-        join_before_host: false,
+        join_before_host: false, // CHANGED: Allows students to join without you
         mute_upon_entry: true,
-        waiting_room: true
+        waiting_room: false     // CHANGED: Disables the admit queue
       }
     };
 
