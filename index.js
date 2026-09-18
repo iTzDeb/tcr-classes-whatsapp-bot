@@ -19,7 +19,7 @@ const CONFIG = {
 
   TIMINGS: {
     MESSAGE_DELAY_MS: 5000,    // E2EE sync buffer between messages
-    SHUTDOWN_DELAY_MS: 20000,  // E2EE sync buffer before turning off
+    SHUTDOWN_DELAY_MS: 120000, // EXTENDED: 120-second E2EE key distribution phase for large/multiple groups
     API_BREATHER_MS: 1000,     // Prevents hitting Zoom rate limits
     ZOOM_RETRY_MS: 2000        // Wait time if Zoom API glitches
   }
@@ -118,9 +118,9 @@ async function createZoomMeeting(accessToken, topic, startTime, durationMins) {
       settings: {
         host_video: true,
         participant_video: false,
-        join_before_host: false, // CHANGED: Allows students to join without you
+        join_before_host: false, 
         mute_upon_entry: true,
-        waiting_room: false     // CHANGED: Disables the admit queue
+        waiting_room: false      
       }
     };
 
@@ -155,7 +155,6 @@ async function processDailySchedules(sock) {
       return;
     }
 
-    // Filter for tomorrow's classes in IST
     const currentUTC = new Date();
     const istNow = new Date(currentUTC.getTime() + (5.5 * 60 * 60 * 1000));
     const istTomorrow = new Date(istNow);
@@ -179,7 +178,6 @@ async function processDailySchedules(sock) {
       return;
     }
 
-    // Group by Center and Course
     const groupedClasses = {};
     for (const item of tomorrowsClasses) {
       const key = `${item.center}_${item.course}`; 
@@ -192,7 +190,6 @@ async function processDailySchedules(sock) {
     const zoomToken = await getZoomAccessToken();
     let zoomCollisionOffset = 1;
 
-    // Dispatch messages
     for (const key in groupedClasses) {
       const group = groupedClasses[key];
       const groupId = groupDirectory[key];
@@ -212,7 +209,6 @@ async function processDailySchedules(sock) {
                     `*Class Schedule*\n` +
                     `📌 ${formattedDate}\n\n`;
 
-      // Check if this specific center is approved for Zoom Links
       const centerNormalized = group.center.toLowerCase().trim();
       const centerRequiresZoom = CONFIG.ZOOM.CENTERS_REQUIRING_ZOOM.includes(centerNormalized);
 
@@ -231,7 +227,6 @@ async function processDailySchedules(sock) {
            if (exactZoomStartTime) {
                const meetingTitle = `TCR ${group.center} ${session.course} - ${session.subject} (${session.faculty})`;
 
-               // Collision offset
                const secondOffset = String(zoomCollisionOffset % 60).padStart(2, '0');
                exactZoomStartTime = exactZoomStartTime.substring(0, 17) + secondOffset;
                zoomCollisionOffset++;
@@ -255,21 +250,17 @@ async function processDailySchedules(sock) {
 
       message += `Regards,\n*TEAM TCR*`;
 
-      // NEW: Split the Google Sheet cell by commas to support multiple groups!
       const groupIdsArray = groupId.split(',').map(id => id.trim());
 
-      // Loop through every ID and send the message
       for (const singleGroupId of groupIdsArray) {
           if (singleGroupId) {
               await sock.sendMessage(singleGroupId, { text: message.trim() });
               console.log(`Sent bundled schedule for ${key} to group ${singleGroupId}`);
               
-              // Pause between each group so WhatsApp doesn't block you for spamming
               await delay(CONFIG.TIMINGS.MESSAGE_DELAY_MS); 
           }
       }
 
-      // Mark as Sent in Google Sheet ONCE after all groups have received it
       for (const session of group.sessions) {
         await axios.post(CONFIG.APPS_SCRIPT_URL, { rowIndex: session.rowIndex });
       }
@@ -303,13 +294,18 @@ async function startBot() {
       console.log('Connected to WhatsApp Web! Processing tomorrow\'s schedules...');
       await processDailySchedules(sock);
       
+      console.log(`All schedules processed. Entering ${CONFIG.TIMINGS.SHUTDOWN_DELAY_MS / 1000}-second E2EE key distribution phase...`);
       setTimeout(() => {
-          console.log('Finished sending messages. Shutting down process.');
+          console.log('Key distribution complete. Closing WebSocket and shutting down process.');
+          
+          // Force flush of the WebSocket before killing the container
+          if (sock.ws) {
+            sock.ws.close();
+          }
           process.exit(0);
       }, CONFIG.TIMINGS.SHUTDOWN_DELAY_MS); 
     }
   });
 }
 
-// Launch the application
 startBot();
