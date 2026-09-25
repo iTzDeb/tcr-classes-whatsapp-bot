@@ -13,7 +13,7 @@
     "@whiskeysockets/baileys": "^7.0.0-rc14",
     "axios": "^1.19.0",
     "qrcode-terminal": "^0.12.0",
-    "link-preview-js": "^5.0.0"
+    "link-preview-js": "^3.0.0"
   },
   "type": "module"
 }
