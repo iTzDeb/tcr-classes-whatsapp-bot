@@ -179,10 +179,21 @@ async function processDailySchedules(sock) {
       return;
     }
 
-    // Group by Center and Course
+    // Normalize group directory keys to lowercase for flexible matching
+    const normalizedDirectory = {};
+    if (groupDirectory) {
+      for (const rawKey in groupDirectory) {
+        normalizedDirectory[rawKey.trim().toLowerCase()] = groupDirectory[rawKey];
+      }
+    }
+
+    // Group by Center and Course (case-insensitive & trimmed)
     const groupedClasses = {};
     for (const item of tomorrowsClasses) {
-      const key = `${item.center}_${item.course}`; 
+      const centerClean = String(item.center || '').trim().toLowerCase();
+      const courseClean = String(item.course || '').trim().toLowerCase();
+      const key = `${centerClean}_${courseClean}`; 
+
       if (!groupedClasses[key]) {
         groupedClasses[key] = { date: item.date, course: item.course, center: item.center, sessions: [] };
       }
@@ -195,7 +206,7 @@ async function processDailySchedules(sock) {
     // Dispatch messages
     for (const key in groupedClasses) {
       const group = groupedClasses[key];
-      const groupId = groupDirectory[key];
+      const groupId = normalizedDirectory[key] || groupDirectory[key];
 
       if (!groupId) {
         console.log(`No group ID routing found in Settings tab for: ${key}`);
@@ -213,7 +224,7 @@ async function processDailySchedules(sock) {
                     `📌 ${formattedDate}\n\n`;
 
       // Check if this specific center is approved for Zoom Links
-      const centerNormalized = group.center.toLowerCase().trim();
+      const centerNormalized = String(group.center || '').toLowerCase().trim();
       const centerRequiresZoom = CONFIG.ZOOM.CENTERS_REQUIRING_ZOOM.includes(centerNormalized);
 
       for (const session of group.sessions) {
@@ -221,7 +232,7 @@ async function processDailySchedules(sock) {
                    `Subject: *${session.subject}*\n` +
                    `Faculty: *${session.faculty.toUpperCase()}*\n`;
         
-        const subjectLower = session.subject.toLowerCase();
+        const subjectLower = String(session.subject || '').toLowerCase();
         const isOfflineEvent = subjectLower.includes('mock') || subjectLower.includes('test');
                     
         if (zoomToken && centerRequiresZoom && !isOfflineEvent) {
@@ -271,9 +282,6 @@ async function processDailySchedules(sock) {
   }
 }
 
-// ============================================================================
-// 5. WHATSAPP CONNECTION & INITIALIZATION
-// ============================================================================
 // ============================================================================
 // 5. WHATSAPP CONNECTION & INITIALIZATION
 // ============================================================================
