@@ -1,4 +1,4 @@
-import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestWaWebVersion } from '@whiskeysockets/baileys';
 import qrcode from 'qrcode-terminal';
 import axios from 'axios';
 
@@ -223,7 +223,7 @@ async function processDailySchedules(sock) {
         
         const subjectLower = session.subject.toLowerCase();
         const isOfflineEvent = subjectLower.includes('mock') || subjectLower.includes('test');
-                   
+                    
         if (zoomToken && centerRequiresZoom && !isOfflineEvent) {
            let exactZoomStartTime = formatZoomStartTime(group.date, session.time);
            const duration = session.zoomDuration || CONFIG.ZOOM.DEFAULT_DURATION_MINS;
@@ -274,18 +274,32 @@ async function processDailySchedules(sock) {
 // ============================================================================
 // 5. WHATSAPP CONNECTION & INITIALIZATION
 // ============================================================================
+// ============================================================================
+// 5. WHATSAPP CONNECTION & INITIALIZATION
+// ============================================================================
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info');
   
+  // Fetch the latest active WhatsApp version to prevent connection hanging
+  const { version, isLatest } = await fetchLatestWaWebVersion();
+  console.log(`Using WA v${version.join('.')}, isLatest: ${isLatest}`);
+  
   const sock = makeWASocket({ 
+    version: version,
     auth: state,
-    printQRInTerminal: false 
+    browser: ["TCR Bot", "Chrome", "120.0.0"] // Helps bypass recent protocol blocks
   });
 
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect } = update;
+    const { connection, lastDisconnect, qr } = update;
+    
+    // Manually generate and print the QR code using qrcode-terminal
+    if (qr) {
+        console.log('\nQR Code generated! Please scan it with your phone:\n');
+        qrcode.generate(qr, { small: true });
+    }
     
     if (connection === 'close') {
       const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
