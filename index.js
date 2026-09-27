@@ -3,7 +3,7 @@ import qrcode from 'qrcode-terminal';
 import axios from 'axios';
 
 // ============================================================================
-// 1. GLOBAL CONFIGURATION (Your Control Panel)
+// 1. GLOBAL CONFIGURATION
 // ============================================================================
 const CONFIG = {
   APPS_SCRIPT_URL: 'https://script.google.com/macros/s/AKfycbzjhoxJDCZvDDre0v1-4Pfpe7y4F4VR7Pw6EtFeNCZIXqwu_Q5FDKf4Vg9FDnFXXWMUlg/exec',
@@ -12,21 +12,25 @@ const CONFIG = {
     ACCOUNT_ID: process.env.ZOOM_ACCOUNT_ID,
     CLIENT_ID: process.env.ZOOM_CLIENT_ID,
     CLIENT_SECRET: process.env.ZOOM_CLIENT_SECRET,
-    // Add new centers here in lowercase to enable Zoom link generation
     CENTERS_REQUIRING_ZOOM: ['laxmi nagar'],
     DEFAULT_DURATION_MINS: 120
   },
 
+  TELEGRAM: {
+    BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
+    CHAT_ID: process.env.TELEGRAM_CHAT_ID
+  },
+
   TIMINGS: {
-    MESSAGE_DELAY_MS: 5000,    // E2EE sync buffer between messages
-    SHUTDOWN_DELAY_MS: 20000,  // E2EE sync buffer before turning off
-    API_BREATHER_MS: 1000,     // Prevents hitting Zoom rate limits
-    ZOOM_RETRY_MS: 2000        // Wait time if Zoom API glitches
+    MESSAGE_DELAY_MS: 5000,
+    SHUTDOWN_DELAY_MS: 15000,
+    API_BREATHER_MS: 1000,
+    ZOOM_RETRY_MS: 2000
   }
 };
 
 // ============================================================================
-// 2. HELPER FUNCTIONS
+// 2. HELPER FUNCTIONS & TELEGRAM ALERTS
 // ============================================================================
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -34,6 +38,22 @@ function getOrdinalSuffix(d) {
   if (d > 3 && d < 21) return 'th';
   switch (d % 10) {
     case 1: return "st"; case 2: return "nd"; case 3: return "rd"; default: return "th";
+  }
+}
+
+async function sendTelegramAlert(text) {
+  if (!CONFIG.TELEGRAM.BOT_TOKEN || !CONFIG.TELEGRAM.CHAT_ID) {
+    console.warn("Telegram alert credentials missing. Skipping alert.");
+    return;
+  }
+  try {
+    await axios.post(`https://api.telegram.org/bot${CONFIG.TELEGRAM.BOT_TOKEN}/sendMessage`, {
+      chat_id: CONFIG.TELEGRAM.CHAT_ID,
+      text: text,
+      parse_mode: 'Markdown'
+    });
+  } catch (e) {
+    console.error("Failed to send Telegram alert:", e?.response?.data || e.message);
   }
 }
 
@@ -103,6 +123,7 @@ async function getZoomAccessToken() {
     return response.data.access_token;
   } catch (e) {
     console.error("Failed to fetch Zoom Token:", e?.response?.data || e.message);
+    await sendTelegramAlert(`⚠️ *Zoom API Alert*\nFailed to fetch access token: ${e.message}`);
     return null;
   }
 }
@@ -155,23 +176,22 @@ async function processDailySchedules(sock) {
       return;
     }
 
-    // Filter for tomorrow's classes in IST
-    const currentUTC = new Date();
-    const istNow = new Date(currentUTC.getTime() + (5.5 * 60 * 60 * 1000));
-    const istTomorrow = new Date(istNow);
-    istTomorrow.setDate(istTomorrow.getDate() + 1);
+    const now = new Date();
+    const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
     
-    const tomYear = istTomorrow.getFullYear();
-    const tomMonth = istTomorrow.getMonth();
-    const tomDate = istTomorrow.getDate();
+    const istFormatter = new Intl.DateTimeFormat('en-US', { 
+      timeZone: 'Asia/Kolkata', 
+      year: 'numeric', 
+      month: 'numeric', 
+      day: 'numeric' 
+    });
+    
+    const tomorrowISTStr = istFormatter.format(tomorrow);
 
     const tomorrowsClasses = allClasses.filter(item => {
-      const rawDateUTC = new Date(item.date);
-      if (isNaN(rawDateUTC)) return false;
-      const rowDateIST = new Date(rawDateUTC.getTime() + (5.5 * 60 * 60 * 1000));
-      return rowDateIST.getFullYear() === tomYear &&
-             rowDateIST.getMonth() === tomMonth &&
-             rowDateIST.getDate() === tomDate;
+      const rowDate = new Date(item.date);
+      if (isNaN(rowDate)) return false;
+      return istFormatter.format(rowDate) === tomorrowISTStr;
     });
 
     if (tomorrowsClasses.length === 0) {
@@ -179,7 +199,6 @@ async function processDailySchedules(sock) {
       return;
     }
 
-    // Normalize group directory keys to lowercase for flexible matching
     const normalizedDirectory = {};
     if (groupDirectory) {
       for (const rawKey in groupDirectory) {
@@ -187,7 +206,6 @@ async function processDailySchedules(sock) {
       }
     }
 
-    // Group by Center and Course (case-insensitive & trimmed)
     const groupedClasses = {};
     for (const item of tomorrowsClasses) {
       const centerClean = String(item.center || '').trim().toLowerCase();
@@ -203,15 +221,18 @@ async function processDailySchedules(sock) {
     const zoomToken = await getZoomAccessToken();
     let zoomCollisionOffset = 1;
 
-    // Dispatch messages
     for (const key in groupedClasses) {
       const group = groupedClasses[key];
-      const groupId = normalizedDirectory[key] || groupDirectory[key];
+      const rawGroupIds = normalizedDirectory[key] || groupDirectory[key];
 
-      if (!groupId) {
-        console.log(`No group ID routing found in Settings tab for: ${key}`);
+      if (!rawGroupIds) {
+        const warnMsg = `⚠️ *Routing Warning*\nNo group ID found in Settings tab for key: \`${key}\``;
+        console.log(warnMsg);
+        await sendTelegramAlert(warnMsg);
         continue;
       }
+
+      const targetGroups = rawGroupIds.split(',').map(id => id.trim()).filter(id => id.length > 0);
 
       const rawDate = new Date(group.date);
       const istDate = new Date(rawDate.getTime() + (5.5 * 60 * 60 * 1000));
@@ -223,7 +244,6 @@ async function processDailySchedules(sock) {
                     `*Class Schedule*\n` +
                     `📌 ${formattedDate}\n\n`;
 
-      // Check if this specific center is approved for Zoom Links
       const centerNormalized = String(group.center || '').toLowerCase().trim();
       const centerRequiresZoom = CONFIG.ZOOM.CENTERS_REQUIRING_ZOOM.includes(centerNormalized);
 
@@ -241,8 +261,7 @@ async function processDailySchedules(sock) {
            
            if (exactZoomStartTime) {
                const meetingTitle = `TCR ${group.center} ${session.course} - ${session.subject} (${session.faculty})`;
-
-               // Collision offset
+               
                const secondOffset = String(zoomCollisionOffset % 60).padStart(2, '0');
                exactZoomStartTime = exactZoomStartTime.substring(0, 17) + secondOffset;
                zoomCollisionOffset++;
@@ -251,13 +270,16 @@ async function processDailySchedules(sock) {
                let joinUrl = await createZoomMeeting(zoomToken, meetingTitle, exactZoomStartTime, duration);
                
                if (!joinUrl) {
-                   console.log(`Retrying Zoom link for ${meetingTitle}...`);
                    await delay(CONFIG.TIMINGS.ZOOM_RETRY_MS);
                    joinUrl = await createZoomMeeting(zoomToken, meetingTitle, exactZoomStartTime, duration);
                }
 
                if (joinUrl) {
                   message += `🔗 *Zoom:* ${joinUrl}\n`;
+               } else {
+                  // Decoupled Fallback so dispatch doesn't stop
+                  message += `🔗 *Zoom:* Link pending (Will be shared shortly)\n`;
+                  await sendTelegramAlert(`⚠️ *Zoom Failed*\nCould not generate Zoom link for: ${meetingTitle}`);
                }
            }
         }
@@ -266,19 +288,30 @@ async function processDailySchedules(sock) {
 
       message += `Regards,\n*TEAM TCR*`;
 
-      // Send via WhatsApp
-      await sock.sendMessage(groupId, { text: message.trim() });
-      console.log(`Sent bundled schedule for ${key}`);
+      let atLeastOneSuccess = false;
+      for (const jid of targetGroups) {
+        try {
+          await sock.sendMessage(jid, { text: message.trim() });
+          console.log(`Sent bundled schedule for ${key} to ${jid}`);
+          atLeastOneSuccess = true;
+          await delay(CONFIG.TIMINGS.MESSAGE_DELAY_MS);
+        } catch (sendErr) {
+          const sendErrMsg = `❌ *WhatsApp Dispatch Error*\nFailed to send message to group \`${jid}\`: ${sendErr.message}`;
+          console.error(sendErrMsg);
+          await sendTelegramAlert(sendErrMsg);
+        }
+      }
 
-      await delay(CONFIG.TIMINGS.MESSAGE_DELAY_MS); 
-
-      // Mark as Sent in Google Sheet
-      for (const session of group.sessions) {
-        await axios.post(CONFIG.APPS_SCRIPT_URL, { rowIndex: session.rowIndex });
+      if (atLeastOneSuccess) {
+        for (const session of group.sessions) {
+          await axios.post(CONFIG.APPS_SCRIPT_URL, { rowIndex: session.rowIndex });
+        }
       }
     }
   } catch (err) {
-    console.error('Error processing schedule:', err.message);
+    const criticalError = `🚨 *CRITICAL BOT SCRIPT ERROR*\n${err.message}`;
+    console.error(criticalError);
+    await sendTelegramAlert(criticalError);
   }
 }
 
@@ -288,14 +321,13 @@ async function processDailySchedules(sock) {
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info');
   
-  // Fetch the latest active WhatsApp version to prevent connection hanging
   const { version, isLatest } = await fetchLatestWaWebVersion();
   console.log(`Using WA v${version.join('.')}, isLatest: ${isLatest}`);
   
   const sock = makeWASocket({ 
     version: version,
     auth: state,
-    browser: ["TCR Bot", "Chrome", "120.0.0"] // Helps bypass recent protocol blocks
+    browser: ["TCR Bot", "Chrome", "120.0.0"]
   });
 
   sock.ev.on('creds.update', saveCreds);
@@ -303,7 +335,6 @@ async function startBot() {
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
     
-    // Manually generate and print the QR code using qrcode-terminal
     if (qr) {
         console.log('\nQR Code generated! Please scan it with your phone:\n');
         qrcode.generate(qr, { small: true });
@@ -315,6 +346,7 @@ async function startBot() {
       if (shouldReconnect) startBot();
     } else if (connection === 'open') {
       console.log('Connected to WhatsApp Web! Processing tomorrow\'s schedules...');
+      
       await processDailySchedules(sock);
       
       setTimeout(() => {
@@ -325,5 +357,4 @@ async function startBot() {
   });
 }
 
-// Launch the application
 startBot();
