@@ -1,36 +1,35 @@
 name: TCR Daily Schedule Dispatcher
 
 on:
-  workflow_dispatch: # This allows Google Apps Script to trigger it remotely
+  # Runs daily at 12:30 PM UTC (6:00 PM IST)
+  schedule:
+    - cron: '30 12 * * *'
+  
+  # Allows manual triggers from GitHub
+  workflow_dispatch:
 
 jobs:
   run-whatsapp-bot:
     runs-on: ubuntu-latest
-# ... [Keep the rest of your file exactly the same from here down] ...
 
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v3
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Setup Node.js Environment
+        uses: actions/setup-node@v3
         with:
-          node-version: '20'
+          node-version: '18'
+          cache: 'npm'
 
       - name: Install Dependencies
-        run: npm install
+        run: npm ci
 
-      - name: Execute WhatsApp Dispatcher
+      - name: Execute Bot Script
         env:
           ZOOM_ACCOUNT_ID: ${{ secrets.ZOOM_ACCOUNT_ID }}
           ZOOM_CLIENT_ID: ${{ secrets.ZOOM_CLIENT_ID }}
           ZOOM_CLIENT_SECRET: ${{ secrets.ZOOM_CLIENT_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: node index.js
-
-      - name: Save Updated WhatsApp Auth State
-        run: |
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add auth_info/
-          git commit -m "Auto-refresh WhatsApp Auth State" || echo "No changes to commit"
-          git push
