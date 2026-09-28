@@ -1,11 +1,11 @@
 name: TCR Daily Schedule Dispatcher
 
 on:
-  # Runs daily at 12:30 PM UTC (6:00 PM IST)
-  schedule:
-    - cron: '30 12 * * *'
-  
-  # Allows manual triggers from GitHub
+  # Allows external API triggers from Google Apps Script
+  repository_dispatch:
+    types: [trigger-schedule-dispatch]
+
+  # Allows manual triggers from GitHub Actions UI
   workflow_dispatch:
 
 jobs:
