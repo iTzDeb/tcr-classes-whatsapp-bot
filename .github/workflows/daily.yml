@@ -9,26 +9,17 @@ on:
   workflow_dispatch:
 
 jobs:
-  run-whatsapp-bot:
+  trigger-daemon-dispatch:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v3
-
-      - name: Setup Node.js Environment
-        uses: actions/setup-node@v3
-        with:
-          node-version: '20'
-
-      - name: Install Dependencies
-        run: npm install
-
-      - name: Execute Bot Script
+      - name: Trigger Dispatch Endpoint on Always-On Bot Server
         env:
-          ZOOM_ACCOUNT_ID: ${{ secrets.ZOOM_ACCOUNT_ID }}
-          ZOOM_CLIENT_ID: ${{ secrets.ZOOM_CLIENT_ID }}
-          ZOOM_CLIENT_SECRET: ${{ secrets.ZOOM_CLIENT_SECRET }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: node index.js
+          BOT_SERVER_URL: ${{ secrets.BOT_SERVER_URL }}
+        run: |
+          if [ -z "$BOT_SERVER_URL" ]; then
+            echo "BOT_SERVER_URL secret not set. Skipping dispatch trigger."
+            exit 0
+          fi
+          echo "Sending trigger request to $BOT_SERVER_URL/dispatch..."
+          curl -s -X POST "$BOT_SERVER_URL/dispatch"

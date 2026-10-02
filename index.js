@@ -1,11 +1,13 @@
 import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestWaWebVersion } from '@whiskeysockets/baileys';
 import qrcode from 'qrcode-terminal';
 import axios from 'axios';
+import express from 'express';
 
 // ============================================================================
 // 1. GLOBAL CONFIGURATION
 // ============================================================================
 const CONFIG = {
+  PORT: process.env.PORT || 8080,
   APPS_SCRIPT_URL: 'https://script.google.com/macros/s/AKfycbzjhoxJDCZvDDre0v1-4Pfpe7y4F4VR7Pw6EtFeNCZIXqwu_Q5FDKf4Vg9FDnFXXWMUlg/exec',
   
   ZOOM: {
@@ -23,7 +25,6 @@ const CONFIG = {
 
   TIMINGS: {
     MESSAGE_DELAY_MS: 5000,
-    SHUTDOWN_DELAY_MS: 15000,
     API_BREATHER_MS: 1000,
     ZOOM_RETRY_MS: 2000
   }
@@ -54,6 +55,32 @@ async function sendTelegramAlert(text) {
     });
   } catch (e) {
     console.error("Failed to send Telegram alert:", e?.response?.data || e.message);
+  }
+}
+
+async function sendTelegramQR(qrCodeData) {
+  if (!CONFIG.TELEGRAM.BOT_TOKEN || !CONFIG.TELEGRAM.CHAT_ID) {
+    console.warn("Telegram credentials missing. Cannot send QR alert.");
+    return;
+  }
+  const now = Date.now();
+  // Throttle sending QR photo to Telegram to at most once every 5 minutes
+  if (now - lastQrSentTime < 5 * 60 * 1000) {
+    console.log("QR refreshed, skipping duplicate Telegram photo alert to prevent spam.");
+    return;
+  }
+  lastQrSentTime = now;
+
+  try {
+    const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qrCodeData)}`;
+    await axios.post(`https://api.telegram.org/bot${CONFIG.TELEGRAM.BOT_TOKEN}/sendPhoto`, {
+      chat_id: CONFIG.TELEGRAM.CHAT_ID,
+      photo: qrImageUrl,
+      caption: '📱 *TCR Bot WhatsApp Re-authentication Required*\n\nPlease scan this QR code with your WhatsApp app to link the session.'
+    });
+    console.log("Sent QR Code image to Telegram successfully!");
+  } catch (e) {
+    console.error("Failed to send QR Code to Telegram:", e?.response?.data || e.message);
   }
 }
 
@@ -316,8 +343,12 @@ async function processDailySchedules(sock) {
 }
 
 // ============================================================================
-// 5. WHATSAPP CONNECTION & INITIALIZATION
+// 5. WHATSAPP CONNECTION & DAEMON INITIALIZATION
 // ============================================================================
+let activeSocket = null;
+let isConnected = false;
+let isProcessing = false;
+
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info');
   
@@ -330,6 +361,8 @@ async function startBot() {
     browser: ["TCR Bot", "Chrome", "120.0.0"]
   });
 
+  activeSocket = sock;
+
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', async (update) => {
@@ -338,23 +371,69 @@ async function startBot() {
     if (qr) {
         console.log('\nQR Code generated! Please scan it with your phone:\n');
         qrcode.generate(qr, { small: true });
+        await sendTelegramQR(qr);
     }
     
     if (connection === 'close') {
+      isConnected = false;
       const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
       console.log('Connection closed. Reconnecting:', shouldReconnect);
-      if (shouldReconnect) startBot();
+      if (shouldReconnect) {
+        setTimeout(startBot, 3000);
+      } else {
+        await sendTelegramAlert('⚠️ *WhatsApp Disconnected*\nSession logged out. Scan QR code to reconnect.');
+      }
     } else if (connection === 'open') {
-      console.log('Connected to WhatsApp Web! Processing tomorrow\'s schedules...');
-      
-      await processDailySchedules(sock);
-      
-      setTimeout(() => {
-          console.log('Finished sending messages. Shutting down process.');
-          process.exit(0);
-      }, CONFIG.TIMINGS.SHUTDOWN_DELAY_MS); 
+      isConnected = true;
+      lastQrSentTime = 0;
+      console.log('✅ Connected to WhatsApp Web! Daemon is active and holding WebSocket 24/7.');
     }
   });
 }
 
-startBot();
+// ============================================================================
+// 6. EXPRESS SERVER & WEBHOOK ENDPOINTS
+// ============================================================================
+const app = express();
+app.use(express.json());
+
+app.get('/', (req, res) => {
+  res.send(`TCR Bot Daemon Online. Status: ${isConnected ? 'Connected' : 'Connecting/Disconnected'}`);
+});
+
+app.get('/status', (req, res) => {
+  res.json({
+    status: 'online',
+    whatsappConnected: isConnected,
+    isProcessing: isProcessing,
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.all('/dispatch', async (req, res) => {
+  if (!activeSocket || !isConnected) {
+    return res.status(503).json({ success: false, message: 'WhatsApp socket is not connected yet.' });
+  }
+
+  if (isProcessing) {
+    return res.status(429).json({ success: false, message: 'Schedule processing is already in progress.' });
+  }
+
+  isProcessing = true;
+  res.json({ success: true, message: 'Schedule dispatch triggered successfully.' });
+
+  try {
+    console.log('Triggering daily schedule dispatch...');
+    await processDailySchedules(activeSocket);
+    console.log('Daily schedule dispatch finished.');
+  } catch (err) {
+    console.error('Error during dispatch trigger:', err.message);
+  } finally {
+    isProcessing = false;
+  }
+});
+
+app.listen(CONFIG.PORT, () => {
+  console.log(`🚀 TCR Bot server running on port ${CONFIG.PORT}`);
+  startBot();
+});
