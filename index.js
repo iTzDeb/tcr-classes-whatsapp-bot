@@ -63,14 +63,6 @@ async function sendTelegramQR(qrCodeData) {
     console.warn("Telegram credentials missing. Cannot send QR alert.");
     return;
   }
-  const now = Date.now();
-  // Throttle sending QR photo to Telegram to at most once every 5 minutes
-  if (now - lastQrSentTime < 5 * 60 * 1000) {
-    console.log("QR refreshed, skipping duplicate Telegram photo alert to prevent spam.");
-    return;
-  }
-  lastQrSentTime = now;
-
   try {
     const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qrCodeData)}`;
     await axios.post(`https://api.telegram.org/bot${CONFIG.TELEGRAM.BOT_TOKEN}/sendPhoto`, {
@@ -385,7 +377,6 @@ async function startBot() {
       }
     } else if (connection === 'open') {
       isConnected = true;
-      lastQrSentTime = 0;
       console.log('✅ Connected to WhatsApp Web! Daemon is active and holding WebSocket 24/7.');
     }
   });
