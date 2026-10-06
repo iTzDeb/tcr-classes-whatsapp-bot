@@ -87,12 +87,24 @@ The Vercel Telegram app writes schedule rows directly through the Google Sheets 
 | `/check` | Read the sheet and count rows with a date and status other than `SENT`. This confirms the bot responded and can read the schedule. |
 | `/list` | Show schedule rows. |
 | `/list <date or text>` | Filter by a date, center, course, subject, faculty, or keyword. |
-| `/create <class details>` or `/add <class details>` | Add a complete row in chronological order. Supports comma-, pipe-, multiline-, and key/value input. It attempts to create a Calendar event and stores its returned `iCalUID` in H. |
+| `/create <class details>` or `/add <class details>` | Add a complete row in chronological order using an explicit A:H range, leaving G empty and storing the Calendar `iCalUID` in H. The entered class date/time is interpreted as Asia/Kolkata (IST) for Calendar creation. |
 | `/update <row> <field> <value>` | Update one field. Supported fields: Date, Time, Center, Course, Subject, Faculty, Status. Changing a detail field clears G for redispatch. |
 | `/update <row> <full row>` | Update A–G for a complete class. It clears G and leaves H untouched. Review calendar consistency after changing class date/time/details. |
 | `/delete <row>` | Permanently delete that schedule row. The current command handler does not first delete its linked Calendar event; inspect/remove the event separately if needed. |
 
 The supplied `/check` smoke test has already been confirmed by the owner. It tests Telegram delivery, webhook execution, and basic Sheets access; it does not prove writes, Calendar access, GAS triggers, Render dispatch, or WhatsApp delivery.
+
+### Repairing rows created by the old append bug
+
+In the reported `/create`, the new class record was written on row 112, but its fields started in column H instead of column A. The earlier implementation used `values.append` with the A:H range; Google Sheets table detection can append after the last populated column in the detected table. The current implementation avoids append/table detection: it inserts the selected row and writes an explicit `A<row>:H<row>` range. This prevents future records from shifting right; it does not move the already-created row automatically.
+
+To repair the newly-created shifted entry:
+
+1. Make a copy of the spreadsheet before editing, and inspect the affected row and its Calendar event.
+2. On that row, copy the six class fields (date, time, center, course, subject, faculty) from their shifted cells (H:M in the screenshot) into **A:F**.
+3. Keep **G** blank unless dispatch is confirmed complete. Identify the Calendar event ID separately; put it in **H** only if it is the correct identifier type for the workflows using it. Do not mistake the shifted date for the event ID or overwrite another value.
+4. Check the row appears correctly with `/list`, then verify its event in the calendar. The Calendar event shown for this entry is also 5h30 later than the requested time; correct that event to the intended IST time after checking its date and details.
+5. Clear the shifted copy of the six class fields only after verifying the repaired A:H values and safely preserving any event identifier. Confirm those cells do not belong to another row/data table. If uncertain, leave extra cells untouched and ask the spreadsheet owner to review.
 
 ### Required Vercel environment variables
 
@@ -263,7 +275,9 @@ Create/manage triggers in Apps Script → **Triggers** (alarm-clock icon). Use o
 | `/check` works but schedule is empty | Confirm `SPREADSHEET_ID`, tab name `Schedule`, row 1 headers, rows have dates in A, and service account has Editor access. `/check` counts only dated rows not marked `SENT`. |
 | Telegram `/create` fails | Confirm full six fields (date, time, center, course, subject, faculty), Sheets API is enabled, service account has sheet Editor access, and chronological date/time formats are parseable. Test in a copy. |
 | Telegram `/create` row exists but Calendar event is missing | Check Vercel logs, `GOOGLE_CALENDAR_ID`, Calendar API enablement, service-account calendar sharing, and event-ID format in H. The handler can still create the row when Calendar sync returns no event. |
-| Calendar duplicates or stale events | Compare Column H with the calendar event ID expected by the code. GAS stores `getId()` while the Telegram app stores API `iCalUID`; validate cross-compatibility and edit/delete behavior on a test calendar. |
+| New Telegram row starts in column H or later | Update/redeploy the Telegram app with the explicit row insert/write fix. For an existing shifted row, use the repair procedure above; the code fix does not move old cells. |
+| Telegram-created Calendar event is 5h30 later than requested | The old API code treated the entered IST wall time as UTC. The current code converts IST to a UTC instant before creating events. Correct old events manually or update them through Calendar after checking the intended date/time; redeploy alone does not modify existing events. |
+| Calendar duplicates or stale events | Compare Column H with the calendar event ID expected by the code. GAS stores `getId()` while the Telegram app stores API `iCalUID`; validate cross-compatibility and edit/delete behavior on a test calendar. Confirm times in the Asia/Kolkata calendar timezone. |
 | Render reports no schedule | Check Apps Script Web App `/exec` returns `{classes, settings}`; GAS deployment version; Render’s `APPS_SCRIPT_URL`; tomorrow/date timezone calculations; and Column G status. |
 | Render `/dispatch` returns 503 | Check Render is running and `/status` says `whatsappConnected: true`; inspect Baileys reconnect/auth logs and relink if logged out. |
 | Render `/dispatch` returns 429 | A prior dispatch is still processing. Wait and inspect logs before retrying; do not start another send in parallel. |
