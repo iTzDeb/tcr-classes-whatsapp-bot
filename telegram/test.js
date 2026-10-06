@@ -12,7 +12,9 @@ const {
   _parseStartTimeToMinutes: parseStartTimeToMinutes,
   _findInsertionRowIndex: findInsertionRowIndex,
   _createScheduleRowValues: createScheduleRowValues,
-  _resolveSheetDetails: resolveSheetDetails
+  _createCalendarStartDate: createCalendarStartDate,
+  _resolveSheetDetails: resolveSheetDetails,
+  _writeScheduleRow: writeScheduleRow
 } = telegramWebhook;
 
 console.log('Running search/filter, natural input & chronological sorting tests...');
@@ -88,6 +90,30 @@ assert.strictEqual(
   6,
   '06 Sept date should be 6'
 );
+assert.strictEqual(
+  parseStartTimeToMinutes('01:00PM - 03:00PM'),
+  13 * 60,
+  '12-hour PM input should parse as a 24-hour local time'
+);
+assert.strictEqual(parseStartTimeToMinutes('25:00'), null, 'Invalid 24-hour times should be rejected');
+
+const istAfternoonStart = createCalendarStartDate('31 Dec 2026', '01:00PM - 03:00PM');
+assert.strictEqual(
+  istAfternoonStart.toISOString(),
+  '2026-12-31T07:30:00.000Z',
+  '1:00 PM IST should be sent to Google Calendar as 07:30 UTC'
+);
+const istEarlyMorningStart = createCalendarStartDate('31 Dec 2026', '01:00AM - 03:00AM');
+assert.strictEqual(
+  new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Kolkata',
+    dateStyle: 'short',
+    timeStyle: 'short'
+  }).format(istEarlyMorningStart),
+  '31/12/2026, 01:00',
+  'UTC conversion should preserve the requested IST date for early-morning classes'
+);
+assert.strictEqual(createCalendarStartDate('31 Dec 2026', 'invalid'), null);
 
 // 5. Chronological Sorting & Insertion Tests
 const existingRows = [
@@ -143,6 +169,36 @@ const scheduleRowValues = createScheduleRowValues({
 assert.strictEqual(scheduleRowValues.length, 8, 'Schedule row should cover columns A-H');
 assert.strictEqual(scheduleRowValues[6], '', 'Column G should remain available for GAS SENT status');
 assert.strictEqual(scheduleRowValues[7], 'calendar-event-icaluid', 'Column H should store the Calendar event iCalUID');
+
+async function testExplicitScheduleRowWrite() {
+  const calls = [];
+  const sheets = {
+    spreadsheets: {
+      batchUpdate: async request => calls.push({ method: 'batchUpdate', request }),
+      values: {
+        append: async () => { throw new Error('Append API must not be used'); },
+        update: async request => calls.push({ method: 'update', request })
+      }
+    }
+  };
+
+  await writeScheduleRow(
+    sheets,
+    { title: 'Schedule', sheetId: 9 },
+    112,
+    scheduleRowValues
+  );
+
+  assert.strictEqual(calls.length, 2);
+  assert.strictEqual(calls[0].method, 'batchUpdate');
+  assert.deepStrictEqual(
+    calls[0].request.requestBody.requests[0].insertDimension.range,
+    { sheetId: 9, dimension: 'ROWS', startIndex: 111, endIndex: 112 }
+  );
+  assert.strictEqual(calls[1].method, 'update');
+  assert.strictEqual(calls[1].request.range, "'Schedule'!A112:H112");
+  assert.deepStrictEqual(calls[1].request.requestBody.values, [scheduleRowValues]);
+}
 
 assert.deepStrictEqual(
   getMissingConfiguration({}),
@@ -274,7 +330,7 @@ async function testOperationalGuards() {
   }
 }
 
-Promise.all([testHealthEndpoint(), testOperationalGuards()])
+Promise.all([testHealthEndpoint(), testOperationalGuards(), testExplicitScheduleRowWrite()])
   .then(() => console.log('All Telegram schedule bot tests passed successfully!'))
   .catch(error => {
     console.error(error);

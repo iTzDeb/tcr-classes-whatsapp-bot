@@ -7,7 +7,7 @@ This app provides Telegram commands for viewing and editing the shared TCR class
 - `/help` or `/start` — show command help.
 - `/check` — show the number of unsent schedule rows.
 - `/list [date or search text]` — list all classes or filter by date, center, course, subject, or faculty.
-- `/create` or `/add` — add a class using comma-separated, pipe-separated, multiline, or key-value input.
+- `/create` or `/add` — add a class using comma-separated, pipe-separated, multiline, or key-value input. It inserts a row and writes explicitly to A:H (G is left blank for the dispatch status; the Calendar `iCalUID` is stored in H). Class date/time input is treated as Asia/Kolkata (IST) when creating Calendar events.
 - `/update <row> <field> <value>` — update one field, or provide a complete row.
 - `/delete <row>` — delete a schedule row.
 
@@ -44,6 +44,8 @@ npm test
 ```
 
 The tests exercise schedule parsing, filtering, insertion ordering, configuration validation, and the health endpoint without modifying the live spreadsheet or sending Telegram messages.
+
+The old create path used Sheets `values.append`, which could place a newly-created record to the right of the schedule table. The explicit insert-and-write path prevents future row shifts; it does not automatically repair an entry created by the old behavior. Back up the sheet and move that entry's six class fields into A:F, leaving G empty and preserving its verified Calendar event ID in H.
 
 ## Google Apps Script interaction
 

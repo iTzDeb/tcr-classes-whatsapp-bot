@@ -156,10 +156,10 @@ function parseDateStrToVal(dateStr) {
 }
 
 function parseStartTimeToMinutes(timeStr) {
-  if (!timeStr) return 0;
+  if (!timeStr) return null;
   const str = String(timeStr).trim().toLowerCase();
   const match = str.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i);
-  if (!match) return 0;
+  if (!match) return null;
 
   let hours = parseInt(match[1], 10);
   const minutes = match[2] ? parseInt(match[2], 10) : 0;
@@ -170,10 +170,51 @@ function parseStartTimeToMinutes(timeStr) {
     else if (str.includes('am')) ampm = 'am';
   }
 
-  if (ampm === 'pm' && hours < 12) hours += 12;
-  if (ampm === 'am' && hours === 12) hours = 0;
+  if (minutes > 59) return null;
+  if (ampm) {
+    if (hours < 1 || hours > 12) return null;
+    if (ampm === 'pm' && hours < 12) hours += 12;
+    if (ampm === 'am' && hours === 12) hours = 0;
+  } else if (hours > 23) {
+    return null;
+  }
 
   return hours * 60 + minutes;
+}
+
+function createCalendarStartDate(dateStr, timeStr) {
+  const dateValue = parseDateStrToVal(dateStr);
+  const startMinutes = parseStartTimeToMinutes(timeStr);
+  if (!dateValue || startMinutes === null) return null;
+
+  const istOffsetMinutes = 5 * 60 + 30;
+  return new Date(dateValue + (startMinutes - istOffsetMinutes) * 60 * 1000);
+}
+
+async function writeScheduleRow(sheets, sheetDetails, targetRowIndex, rowValues) {
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: SPREADSHEET_ID,
+    requestBody: {
+      requests: [{
+        insertDimension: {
+          range: {
+            sheetId: sheetDetails.sheetId,
+            dimension: 'ROWS',
+            startIndex: targetRowIndex - 1,
+            endIndex: targetRowIndex
+          },
+          inheritFromBefore: true
+        }
+      }]
+    }
+  });
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `'${sheetDetails.title}'!A${targetRowIndex}:H${targetRowIndex}`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: [rowValues] }
+  });
 }
 
 function findInsertionRowIndex(existingRows, newDateVal, newTimeVal) {
@@ -348,12 +389,8 @@ async function createCalendarEvent({ dateStr, timeStr, center, course, subject, 
   const calendarId = process.env.GOOGLE_CALENDAR_ID || 'primary';
   try {
     const calendar = getCalendarClient();
-    const dateVal = parseDateStrToVal(dateStr);
-    if (!dateVal) return null;
-
-    const startMinutes = parseStartTimeToMinutes(timeStr);
-    const startDate = new Date(dateVal);
-    startDate.setUTCHours(Math.floor(startMinutes / 60), startMinutes % 60, 0, 0);
+    const startDate = createCalendarStartDate(dateStr, timeStr);
+    if (!startDate) return null;
 
     // Default duration 2 hours
     const endDate = new Date(startDate.getTime() + 2 * 60 * 60 * 1000);
@@ -686,6 +723,11 @@ async function handleCreateCommand(chatId, argsStr) {
   }
 
   const { date: dateVal, time: timeVal, center: centerVal, course: courseVal, subject: subjectVal, faculty: facultyVal } = parsed;
+  const startTimeMinutes = parseStartTimeToMinutes(timeVal);
+  if (!parseDateStrToVal(dateVal) || startTimeMinutes === null) {
+    await sendTelegramMessage(chatId, `⚠️ Invalid date or start time. Use a valid date and time, for example \`31 Dec 2026, 01:00PM - 03:00PM\`.`);
+    return;
+  }
 
   // 1. Sync to Google Calendar
   let calendarEventId = '';
@@ -722,46 +764,12 @@ async function handleCreateCommand(chatId, argsStr) {
   const newTimeVal = parseStartTimeToMinutes(timeVal);
 
   const targetRowIndex = findInsertionRowIndex(existingRows, newDateVal, newTimeVal);
-
-  if (targetRowIndex > existingRows.length) {
-    // Append at the bottom of the sheet
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `'${sheetDetails.title}'!A:H`,
-      valueInputOption: 'USER_ENTERED',
-      requestBody: {
-        values: [createScheduleRowValues(parsed, calendarEventId)]
-      }
-    });
-  } else {
-    // Insert a new row at targetRowIndex (convert to 0-based start/end index)
-    await sheets.spreadsheets.batchUpdate({
-      spreadsheetId: SPREADSHEET_ID,
-      requestBody: {
-        requests: [{
-          insertDimension: {
-            range: {
-              sheetId: sheetDetails.sheetId,
-              dimension: 'ROWS',
-              startIndex: targetRowIndex - 1,
-              endIndex: targetRowIndex
-            },
-            inheritFromBefore: true
-          }
-        }]
-      }
-    });
-
-    // Populate row values at targetRowIndex
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `'${sheetDetails.title}'!A${targetRowIndex}:H${targetRowIndex}`,
-      valueInputOption: 'USER_ENTERED',
-      requestBody: {
-        values: [createScheduleRowValues(parsed, calendarEventId)]
-      }
-    });
-  }
+  await writeScheduleRow(
+    sheets,
+    sheetDetails,
+    targetRowIndex,
+    createScheduleRowValues(parsed, calendarEventId)
+  );
 
   const confirmMsg =
     `✅ *Class Created Successfully! (Sorted Chronologically)*\n\n` +
@@ -911,7 +919,9 @@ module.exports._parseDateStrToVal = parseDateStrToVal;
 module.exports._parseStartTimeToMinutes = parseStartTimeToMinutes;
 module.exports._findInsertionRowIndex = findInsertionRowIndex;
 module.exports._createScheduleRowValues = createScheduleRowValues;
+module.exports._createCalendarStartDate = createCalendarStartDate;
 module.exports._getMissingConfiguration = getMissingConfiguration;
 module.exports._hasCompleteScheduleDetails = hasCompleteScheduleDetails;
 module.exports._resolveSheetDetails = resolveSheetDetails;
 module.exports._isValidWebhookSecret = isValidWebhookSecret;
+module.exports._writeScheduleRow = writeScheduleRow;
