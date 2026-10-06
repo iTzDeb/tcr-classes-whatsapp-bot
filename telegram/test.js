@@ -4,6 +4,7 @@ const telegramWebhook = require('./api/index');
 const {
   _getMissingConfiguration: getMissingConfiguration,
   _hasCompleteScheduleDetails: hasCompleteScheduleDetails,
+  _isValidWebhookSecret: isValidWebhookSecret,
   _normalizeText: normalizeText,
   _matchesFilter: matchesFilter,
   _parseCreateArgs: parseCreateArgs,
@@ -145,7 +146,7 @@ assert.strictEqual(scheduleRowValues[7], 'calendar-event-icaluid', 'Column H sho
 
 assert.deepStrictEqual(
   getMissingConfiguration({}),
-  ['TELEGRAM_BOT_TOKEN', 'AUTHORIZED_CHAT_ID', 'SPREADSHEET_ID', 'GOOGLE_SERVICE_ACCOUNT_KEY'],
+  ['TELEGRAM_BOT_TOKEN', 'AUTHORIZED_CHAT_ID', 'SPREADSHEET_ID', 'GOOGLE_SERVICE_ACCOUNT_KEY', 'TELEGRAM_WEBHOOK_SECRET'],
   'All required deployment configuration should be reported when missing'
 );
 assert.deepStrictEqual(
@@ -153,11 +154,15 @@ assert.deepStrictEqual(
     TELEGRAM_BOT_TOKEN: 'configured',
     AUTHORIZED_CHAT_ID: 'configured',
     SPREADSHEET_ID: 'configured',
-    GOOGLE_SERVICE_ACCOUNT_KEY: 'configured'
+    GOOGLE_SERVICE_ACCOUNT_KEY: 'configured',
+    TELEGRAM_WEBHOOK_SECRET: 'configured'
   }),
   [],
   'A complete deployment configuration should pass validation'
 );
+assert.strictEqual(isValidWebhookSecret('expected-secret', 'expected-secret'), true);
+assert.strictEqual(isValidWebhookSecret('wrong-secret', 'expected-secret'), false);
+assert.strictEqual(isValidWebhookSecret(undefined, 'expected-secret'), false);
 assert.strictEqual(
   hasCompleteScheduleDetails({ date: '1 Oct', time: '9AM', center: 'A', course: 'B', subject: 'C', faculty: 'D' }),
   true
@@ -195,7 +200,13 @@ async function testHealthEndpoint() {
 }
 
 async function testOperationalGuards() {
-  const configNames = ['TELEGRAM_BOT_TOKEN', 'AUTHORIZED_CHAT_ID', 'SPREADSHEET_ID', 'GOOGLE_SERVICE_ACCOUNT_KEY'];
+  const configNames = [
+    'TELEGRAM_BOT_TOKEN',
+    'AUTHORIZED_CHAT_ID',
+    'SPREADSHEET_ID',
+    'GOOGLE_SERVICE_ACCOUNT_KEY',
+    'TELEGRAM_WEBHOOK_SECRET'
+  ];
   const originalValues = new Map(configNames.map(name => [name, process.env[name]]));
   try {
     configNames.forEach(name => delete process.env[name]);
@@ -232,6 +243,35 @@ async function testOperationalGuards() {
     () => resolveSheetDetails({ spreadsheets: { get: async () => ({ data: { sheets: [] } }) } }),
     /does not contain a usable sheet tab/
   );
+
+  const env = {
+    TELEGRAM_BOT_TOKEN: 'configured',
+    AUTHORIZED_CHAT_ID: 'configured',
+    SPREADSHEET_ID: 'configured',
+    GOOGLE_SERVICE_ACCOUNT_KEY: 'configured',
+    TELEGRAM_WEBHOOK_SECRET: 'expected-secret'
+  };
+  const webhookOriginalValues = new Map(Object.entries(env).map(([name]) => [name, process.env[name]]));
+  try {
+    for (const [name, value] of Object.entries(env)) process.env[name] = value;
+
+    const rejectedResponse = createMockResponse();
+    await telegramWebhook({ method: 'POST', headers: {}, body: {} }, rejectedResponse);
+    assert.strictEqual(rejectedResponse.statusCode, 401, 'Webhook should reject missing Telegram secret header');
+
+    const acceptedResponse = createMockResponse();
+    await telegramWebhook({
+      method: 'POST',
+      headers: { 'x-telegram-bot-api-secret-token': 'expected-secret' },
+      body: {}
+    }, acceptedResponse);
+    assert.strictEqual(acceptedResponse.statusCode, 200, 'Webhook should accept the configured Telegram secret');
+  } finally {
+    for (const [name, value] of webhookOriginalValues) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
 }
 
 Promise.all([testHealthEndpoint(), testOperationalGuards()])

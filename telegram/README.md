@@ -18,6 +18,7 @@ Deploy this directory as the Vercel project's **Root Directory**. Configure thes
 | Variable | Required | Purpose |
 | --- | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | Yes | A current token from Telegram BotFather. Do not commit it. |
+| `TELEGRAM_WEBHOOK_SECRET` | Yes | Random secret (1-256 letters, digits, `_`, or `-`) sent by Telegram with each webhook update. Must match the secret used with `setWebhook`. |
 | `AUTHORIZED_CHAT_ID` | Yes | Telegram chat or user ID allowed to use commands. |
 | `SPREADSHEET_ID` | Yes | ID of the Google spreadsheet containing the schedule. |
 | `GOOGLE_SERVICE_ACCOUNT_KEY` | Yes | Google service-account JSON, either raw JSON or base64-encoded JSON. |
@@ -25,13 +26,13 @@ Deploy this directory as the Vercel project's **Root Directory**. Configure thes
 
 Share the spreadsheet with the service account email as an Editor. If calendar event creation is required, enable the Google Calendar API and share the target calendar with that service account with permission to make changes to events. Enable the Google Sheets API in the service account's Google Cloud project as well.
 
-The webhook accepts Telegram `POST` updates at `/`; `GET /` is a health check. After deployment, set Telegram's webhook to the deployed root URL:
+The webhook accepts Telegram `POST` updates at `/` only when the `X-Telegram-Bot-Api-Secret-Token` header matches `TELEGRAM_WEBHOOK_SECRET`; `GET /` is a health check. Configure this value as a Vercel Production environment variable, then set Telegram's webhook to the deployed root URL with the same secret:
 
 ```text
-https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://<YOUR_VERCEL_DOMAIN>/
+https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://<YOUR_VERCEL_DOMAIN>/&secret_token=<TELEGRAM_WEBHOOK_SECRET>
 ```
 
-Check the result with Telegram's `getWebhookInfo` endpoint. Keep the bot token out of shell history, chat messages, and repository files when making these requests.
+Check the result with Telegram's `getWebhookInfo` endpoint. Do not include either secret in shell history, chat messages, or repository files. Since Telegram webhooks cannot add a Vercel SSO login, the Vercel production endpoint must be publicly reachable; the webhook-secret validation protects POST updates.
 
 ## Local checks
 
