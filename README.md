@@ -90,9 +90,13 @@ The Vercel Telegram app writes schedule rows directly through the Google Sheets 
 | `/create <class details>` or `/add <class details>` | Add a complete row in chronological order using an explicit A:H range, leaving G empty and storing the Calendar `iCalUID` in H. The entered class date/time is interpreted as Asia/Kolkata (IST) for Calendar creation. |
 | `/update <row> <field> <value>` | Update one field. Supported fields: Date, Time, Center, Course, Subject, Faculty, Status. Changing a detail field clears G for redispatch. |
 | `/update <row> <full row>` | Update A–G for a complete class. It clears G and leaves H untouched. Review calendar consistency after changing class date/time/details. |
-| `/delete <row>` | Permanently delete that schedule row. The current command handler does not first delete its linked Calendar event; inspect/remove the event separately if needed. |
+| `/delete <row>` | Delete the linked Calendar event in H, then permanently delete the schedule row. If Calendar deletion fails, the row is kept. If H is empty or the event is already gone, the bot reports that and deletes the row. |
 
 The supplied `/check` smoke test has already been confirmed by the owner. It tests Telegram delivery, webhook execution, and basic Sheets access; it does not prove writes, Calendar access, GAS triggers, Render dispatch, or WhatsApp delivery.
+
+The Telegram `/start` and `/help` commands also register the Telegram command menu, including `/help`, using Bot API `setMyCommands`. Command failures are reported in the chat with a safe error summary and a reference ID for matching Vercel function logs. If Calendar creation fails during `/create`, the bot clearly reports that the schedule row was saved without an event. Calendar/Sheets failures during `/delete` stop the deletion when the event could not be removed, to avoid leaving an orphaned event.
+
+**Important:** deleting a row directly in Google Sheets does not call the Telegram bot and cannot automatically remove its Calendar event. Use Telegram `/delete <row>` for linked cleanup. Before deleting a row, check that its row number is current and that H contains the intended event identifier.
 
 ### Repairing rows created by the old append bug
 
@@ -277,7 +281,7 @@ Create/manage triggers in Apps Script → **Triggers** (alarm-clock icon). Use o
 | Telegram `/create` row exists but Calendar event is missing | Check Vercel logs, `GOOGLE_CALENDAR_ID`, Calendar API enablement, service-account calendar sharing, and event-ID format in H. The handler can still create the row when Calendar sync returns no event. |
 | New Telegram row starts in column H or later | Update/redeploy the Telegram app with the explicit row insert/write fix. For an existing shifted row, use the repair procedure above; the code fix does not move old cells. |
 | Telegram-created Calendar event is 5h30 later than requested | The old API code treated the entered IST wall time as UTC. The current code converts IST to a UTC instant before creating events. Correct old events manually or update them through Calendar after checking the intended date/time; redeploy alone does not modify existing events. |
-| Calendar duplicates or stale events | Compare Column H with the calendar event ID expected by the code. GAS stores `getId()` while the Telegram app stores API `iCalUID`; validate cross-compatibility and edit/delete behavior on a test calendar. Confirm times in the Asia/Kolkata calendar timezone. |
+| Calendar duplicates or stale events | Compare Column H with the calendar event ID expected by the code. Telegram `/delete` searches by `iCalUID` and falls back to deleting by event ID, supporting Telegram- and GAS-created references. Validate with a test calendar and confirm times in the Asia/Kolkata calendar timezone. Deleting directly in Sheets does not remove Calendar events. |
 | Render reports no schedule | Check Apps Script Web App `/exec` returns `{classes, settings}`; GAS deployment version; Render’s `APPS_SCRIPT_URL`; tomorrow/date timezone calculations; and Column G status. |
 | Render `/dispatch` returns 503 | Check Render is running and `/status` says `whatsappConnected: true`; inspect Baileys reconnect/auth logs and relink if logged out. |
 | Render `/dispatch` returns 429 | A prior dispatch is still processing. Wait and inspect logs before retrying; do not start another send in parallel. |

@@ -14,7 +14,10 @@ const {
   _createScheduleRowValues: createScheduleRowValues,
   _createCalendarStartDate: createCalendarStartDate,
   _resolveSheetDetails: resolveSheetDetails,
-  _writeScheduleRow: writeScheduleRow
+  _writeScheduleRow: writeScheduleRow,
+  _deleteCalendarEvent: deleteCalendarEvent,
+  _deleteScheduleRow: deleteScheduleRow,
+  _telegramCommands: telegramCommands
 } = telegramWebhook;
 
 console.log('Running search/filter, natural input & chronological sorting tests...');
@@ -200,6 +203,80 @@ async function testExplicitScheduleRowWrite() {
   assert.deepStrictEqual(calls[1].request.requestBody.values, [scheduleRowValues]);
 }
 
+async function testCalendarAndRowDeletion() {
+  const calls = [];
+  const calendar = {
+    events: {
+      get: async () => { const error = new Error('Not found'); error.code = 404; throw error; },
+      list: async request => {
+        calls.push({ method: 'list', request });
+        return { data: { items: [{ id: 'calendar-event-id' }] } };
+      },
+      delete: async request => calls.push({ method: 'calendar-delete', request })
+    }
+  };
+  const sheets = {
+    spreadsheets: {
+      values: {
+        get: async request => {
+          calls.push({ method: 'get-row', request });
+          return { data: { values: [['07 Oct 2026', '3PM', 'Center', 'Course', 'Subject', 'Faculty', '', 'class-ical-uid']] } };
+        }
+      },
+      batchUpdate: async request => calls.push({ method: 'sheet-delete', request })
+    }
+  };
+
+  const result = await deleteScheduleRow(sheets, calendar, { title: 'Schedule', sheetId: 9 }, 12, 'calendar-id');
+  assert.strictEqual(result, 'deleted');
+  assert.deepStrictEqual(
+    calls.map(call => call.method),
+    ['get-row', 'list', 'calendar-delete', 'sheet-delete'],
+    'The event should be deleted before its linked row'
+  );
+  assert.strictEqual(calls[1].request.iCalUID, 'class-ical-uid');
+  assert.deepStrictEqual(calls[2].request, { calendarId: 'calendar-id', eventId: 'calendar-event-id' });
+  assert.strictEqual(calls[3].request.requestBody.requests[0].deleteDimension.range.startIndex, 11);
+
+  const directIdCalls = [];
+  assert.strictEqual(await deleteCalendarEvent({
+    events: {
+      get: async request => directIdCalls.push({ method: 'get', request }),
+      delete: async request => directIdCalls.push({ method: 'delete', request }),
+      list: async () => { throw new Error('iCalUID lookup should not be needed'); }
+    }
+  }, 'calendar-id', 'gas-event-id'), 'deleted');
+  assert.deepStrictEqual(directIdCalls.map(call => call.method), ['get', 'delete']);
+
+  let rowDeleted = false;
+  await assert.rejects(
+    () => deleteScheduleRow({
+      spreadsheets: {
+        values: { get: async () => ({ data: { values: [['date', 'time', 'center', 'course', 'subject', 'faculty', '', 'uid']] } }) },
+        batchUpdate: async () => { rowDeleted = true; }
+      }
+    }, {
+      events: {
+        list: async () => { throw new Error('Calendar permission denied'); }
+      }
+    }, { title: 'Schedule', sheetId: 9 }, 12, 'calendar-id'),
+    error => error.userMessage.includes('schedule row 12 was kept'),
+    'Calendar failures should explain that the row was not removed'
+  );
+  assert.strictEqual(rowDeleted, false, 'Do not remove the row when event deletion fails');
+
+  const notFoundCalendar = {
+    events: {
+      get: async () => { const error = new Error('Not found'); error.code = 404; throw error; },
+      list: async () => ({ data: { items: [] } }),
+      delete: async () => { const error = new Error('Not found'); error.code = 404; throw error; }
+    }
+  };
+  assert.strictEqual(await deleteCalendarEvent(notFoundCalendar, 'calendar-id', 'stale-id'), 'not-found');
+  assert.ok(telegramCommands.some(command => command.command === 'help'));
+  assert.ok(telegramCommands.some(command => command.command === 'delete'));
+}
+
 assert.deepStrictEqual(
   getMissingConfiguration({}),
   ['TELEGRAM_BOT_TOKEN', 'AUTHORIZED_CHAT_ID', 'SPREADSHEET_ID', 'GOOGLE_SERVICE_ACCOUNT_KEY', 'TELEGRAM_WEBHOOK_SECRET'],
@@ -330,7 +407,12 @@ async function testOperationalGuards() {
   }
 }
 
-Promise.all([testHealthEndpoint(), testOperationalGuards(), testExplicitScheduleRowWrite()])
+Promise.all([
+  testHealthEndpoint(),
+  testOperationalGuards(),
+  testExplicitScheduleRowWrite(),
+  testCalendarAndRowDeletion()
+])
   .then(() => console.log('All Telegram schedule bot tests passed successfully!'))
   .catch(error => {
     console.error(error);

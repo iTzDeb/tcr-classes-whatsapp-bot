@@ -8,6 +8,15 @@ const AUTHORIZED_CHAT_ID = process.env.AUTHORIZED_CHAT_ID;
 const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET;
 const DEFAULT_SHEET_TAB = 'Schedule';
 const crypto = require('crypto');
+const TELEGRAM_COMMANDS = [
+  { command: 'start', description: 'Open the bot help menu' },
+  { command: 'help', description: 'Show available commands and examples' },
+  { command: 'check', description: 'Check pending classes and bot access' },
+  { command: 'list', description: 'View or search the class schedule' },
+  { command: 'create', description: 'Add a class to the schedule' },
+  { command: 'update', description: 'Update a schedule row' },
+  { command: 'delete', description: 'Delete a class and its linked event' }
+];
 
 function getMissingConfiguration(env = process.env) {
   return [
@@ -384,40 +393,120 @@ function getCalendarClient() {
   return google.calendar({ version: 'v3', auth });
 }
 
+function isGoogleNotFoundError(error) {
+  return error.code === 404 || error.response?.status === 404;
+}
+
+async function deleteCalendarEvent(calendar, calendarId, storedEventId) {
+  if (!storedEventId) return 'not-linked';
+
+  try {
+    await calendar.events.get({ calendarId, eventId: storedEventId });
+    await calendar.events.delete({ calendarId, eventId: storedEventId });
+    return 'deleted';
+  } catch (error) {
+    if (!isGoogleNotFoundError(error)) throw error;
+  }
+
+  const matchingEvents = await calendar.events.list({
+    calendarId,
+    iCalUID: storedEventId,
+    maxResults: 2
+  });
+  const events = matchingEvents.data.items || [];
+
+  if (events.length > 1) {
+    throw new Error('More than one Calendar event matches the identifier in column H. No event or row was deleted.');
+  }
+
+  const eventId = events.length === 1 ? events[0].id : null;
+  if (!eventId) return 'not-found';
+
+  try {
+    await calendar.events.delete({ calendarId, eventId });
+    return 'deleted';
+  } catch (error) {
+    if (isGoogleNotFoundError(error)) return 'not-found';
+    throw error;
+  }
+}
+
+async function deleteScheduleRow(sheets, calendar, sheetDetails, rowNum, calendarId) {
+  const rowResponse = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `'${sheetDetails.title}'!A${rowNum}:H${rowNum}`
+  });
+  const rowValues = rowResponse.data.values?.[0] || [];
+  if (!rowValues.some(value => String(value || '').trim())) {
+    throw new Error(`Schedule row ${rowNum} is empty. Nothing was deleted.`);
+  }
+
+  let calendarDeleteResult = 'not-linked';
+  const storedEventId = String(rowValues[7] || '').trim();
+  if (storedEventId) {
+    try {
+      calendarDeleteResult = await deleteCalendarEvent(calendar, calendarId, storedEventId);
+    } catch (error) {
+      error.userMessage = `Calendar deletion failed, so schedule row ${rowNum} was kept. Check Calendar access and the event identifier in column H, then retry.`;
+      throw error;
+    }
+  }
+
+  try {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: SPREADSHEET_ID,
+      requestBody: {
+        requests: [{
+          deleteDimension: {
+            range: {
+              sheetId: sheetDetails.sheetId,
+              dimension: 'ROWS',
+              startIndex: rowNum - 1,
+              endIndex: rowNum
+            }
+          }
+        }]
+      }
+    });
+  } catch (error) {
+    error.userMessage = calendarDeleteResult === 'deleted'
+      ? `The Calendar event was deleted, but schedule row ${rowNum} could not be removed. The row remains; remove it manually after checking the event is gone.`
+      : `Schedule row ${rowNum} could not be removed. Check Google Sheets access and retry.`;
+    throw error;
+  }
+
+  return calendarDeleteResult;
+}
+
 // Function to automatically sync class to Google Calendar
 async function createCalendarEvent({ dateStr, timeStr, center, course, subject, faculty }) {
   const calendarId = process.env.GOOGLE_CALENDAR_ID || 'primary';
-  try {
-    const calendar = getCalendarClient();
-    const startDate = createCalendarStartDate(dateStr, timeStr);
-    if (!startDate) return null;
+  const calendar = getCalendarClient();
+  const startDate = createCalendarStartDate(dateStr, timeStr);
+  if (!startDate) return null;
 
-    // Default duration 2 hours
-    const endDate = new Date(startDate.getTime() + 2 * 60 * 60 * 1000);
+  // Default duration 2 hours
+  const endDate = new Date(startDate.getTime() + 2 * 60 * 60 * 1000);
 
-    const summary = `${course} - ${subject} (${faculty}) @ ${center}`;
-    const description = `Class Schedule: ${course} - ${subject}\nFaculty: ${faculty}\nCenter: ${center}\nTime: ${timeStr}`;
+  const summary = `${course} - ${subject} (${faculty}) @ ${center}`;
+  const description = `Class Schedule: ${course} - ${subject}\nFaculty: ${faculty}\nCenter: ${center}\nTime: ${timeStr}`;
 
-    const res = await calendar.events.insert({
-      calendarId: calendarId,
-      requestBody: {
-        summary: summary,
-        location: center,
-        description: description,
-        start: {
-          dateTime: startDate.toISOString(),
-        },
-        end: {
-          dateTime: endDate.toISOString(),
-        },
+  const res = await calendar.events.insert({
+    calendarId: calendarId,
+    requestBody: {
+      summary: summary,
+      location: center,
+      description: description,
+      start: {
+        dateTime: startDate.toISOString(),
       },
-    });
+      end: {
+        dateTime: endDate.toISOString(),
+      },
+    },
+  });
 
-    return res.data;
-  } catch (err) {
-    console.error('Google Calendar Sync Error:', err.message);
-    return null;
-  }
+  return res.data;
 }
 
 // Dynamically resolve target sheet tab name and sheet ID
@@ -485,6 +574,54 @@ function sendTelegramMessage(chatId, text, parseMode = 'Markdown') {
   });
 }
 
+function setTelegramCommandMenu() {
+  const data = JSON.stringify({ commands: TELEGRAM_COMMANDS });
+
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: 'api.telegram.org',
+      port: 443,
+      path: `/bot${TELEGRAM_BOT_TOKEN}/setMyCommands`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(data)
+      }
+    };
+
+    const req = https.request(options, response => {
+      let body = '';
+      response.on('data', chunk => body += chunk);
+      response.on('end', () => {
+        let result;
+        try {
+          result = JSON.parse(body);
+        } catch {
+          reject(new Error('Telegram returned an invalid response while setting the command menu.'));
+          return;
+        }
+        if (response.statusCode < 200 || response.statusCode >= 300 || result.ok !== true) {
+          reject(new Error(`Telegram command menu setup failed: ${result.description || response.statusCode}`));
+          return;
+        }
+        resolve(result.result);
+      });
+    });
+
+    req.on('error', reject);
+    req.setTimeout(10000, () => req.destroy(new Error('Telegram command menu setup timed out.')));
+    req.write(data);
+    req.end();
+  });
+}
+
+function getSafeErrorDetails(error) {
+  const status = error.code || error.response?.status;
+  const message = String(error.message || 'Unknown error').replace(/[\r\n`]/g, ' ').slice(0, 240);
+  const safeMessage = message.replace(/([_*[\]()])/g, '\\$1');
+  return status ? `${safeMessage} (code ${status})` : safeMessage;
+}
+
 function isAuthorized(chatId, userId) {
   const strChatId = String(chatId);
   const strUserId = String(userId || '');
@@ -535,7 +672,7 @@ module.exports = async (req, res) => {
     res.status(200).json({ ok: true });
   } catch (err) {
     console.error('Webhook Handler Error:', err);
-    res.status(200).json({ ok: true, error: err.message });
+    res.status(200).json({ ok: true });
   }
 };
 
@@ -571,8 +708,16 @@ async function handleTelegramCommand(chatId, text) {
       `📌 */delete* _RowNumber_\n` +
       `Delete row. Example: \`/delete 15\`\n\n` +
       `📌 */check*\n` +
-      `Check bot online status and pending dispatches.`;
+      `Check bot online status and pending dispatches.\n\n` +
+      `🗑️ When you use */delete*, the bot also deletes the linked Calendar event stored in column H. Deleting a row directly in Sheets does not trigger this cleanup.`;
 
+    try {
+      await setTelegramCommandMenu();
+    } catch (error) {
+      const referenceId = crypto.randomUUID();
+      console.error('Telegram command menu setup error:', { referenceId, message: error.message });
+      await sendTelegramMessage(chatId, `⚠️ The help text is available, but Telegram could not refresh its command menu. Try /help again later. Reference: \`${referenceId}\``);
+    }
     await sendTelegramMessage(chatId, helpMsg);
     return;
   }
@@ -622,8 +767,15 @@ async function handleTelegramCommand(chatId, text) {
 
     await sendTelegramMessage(chatId, `⚠️ Unknown command. Type /help to see all available commands.`);
   } catch (err) {
-    console.error('Command Execution Error:', err);
-    await sendTelegramMessage(chatId, `⚠️ *Google Sheets API Error:* \`${err.message}\`\n\n_Please check that your Service Account email is shared on the Google Sheet as Editor._`);
+    const referenceId = crypto.randomUUID();
+    console.error('Command Execution Error:', {
+      referenceId,
+      command,
+      message: err.message,
+      code: err.code || err.response?.status
+    });
+    const report = err.userMessage || `The command failed: ${getSafeErrorDetails(err)}.`;
+    await sendTelegramMessage(chatId, `⚠️ ${report}\nReference: \`${referenceId}\``);
   }
 }
 
@@ -732,6 +884,7 @@ async function handleCreateCommand(chatId, argsStr) {
   // 1. Sync to Google Calendar
   let calendarEventId = '';
   let calSyncText = '⏳ Pending';
+  let calendarSyncFailure = '';
   try {
     const calResult = await createCalendarEvent({
       dateStr: dateVal,
@@ -747,7 +900,10 @@ async function handleCreateCommand(chatId, argsStr) {
       calSyncText = '✅ Synced to Google Calendar';
     }
   } catch (err) {
-    console.error('Calendar auto-sync error:', err.message);
+    const referenceId = crypto.randomUUID();
+    console.error('Calendar auto-sync error:', { referenceId, message: err.message, code: err.code || err.response?.status });
+    calendarSyncFailure = `\n\n⚠️ Calendar event was not created. The schedule row was saved without a linked event. Reference: \`${referenceId}\``;
+    calSyncText = '⚠️ Not synced';
   }
 
   const sheets = getSheetsClient();
@@ -779,7 +935,7 @@ async function handleCreateCommand(chatId, argsStr) {
     `🏛 *Center:* ${centerVal}\n` +
     `📚 *Course:* ${courseVal} - ${subjectVal}\n` +
     `👨‍🏫 *Faculty:* ${facultyVal}\n` +
-    `📅 *Calendar:* ${calSyncText}`;
+    `📅 *Calendar:* ${calSyncText}${calendarSyncFailure}`;
 
   await sendTelegramMessage(chatId, confirmMsg);
 }
@@ -890,25 +1046,17 @@ async function handleDeleteCommand(chatId, argsStr) {
   }
 
   const sheets = getSheetsClient();
+  const calendar = getCalendarClient();
   const sheetDetails = await resolveSheetDetails(sheets);
+  const calendarId = process.env.GOOGLE_CALENDAR_ID || 'primary';
+  const calendarDeleteResult = await deleteScheduleRow(sheets, calendar, sheetDetails, rowNum, calendarId);
 
-  await sheets.spreadsheets.batchUpdate({
-    spreadsheetId: SPREADSHEET_ID,
-    requestBody: {
-      requests: [{
-        deleteDimension: {
-          range: {
-            sheetId: sheetDetails.sheetId,
-            dimension: 'ROWS',
-            startIndex: rowNum - 1,
-            endIndex: rowNum
-          }
-        }
-      }]
-    }
-  });
-
-  await sendTelegramMessage(chatId, `🗑️ *Class Row ${rowNum} Deleted Successfully!*`);
+  const calendarStatus = {
+    deleted: 'The linked Calendar event was deleted.',
+    'not-found': 'The linked Calendar event was already missing; the schedule row was deleted.',
+    'not-linked': 'No Calendar event ID was present in column H; only the schedule row was deleted.'
+  }[calendarDeleteResult];
+  await sendTelegramMessage(chatId, `🗑️ *Class Row ${rowNum} Deleted Successfully!*\n${calendarStatus}`);
 }
 
 // Export internal functions for unit testing
@@ -925,3 +1073,7 @@ module.exports._hasCompleteScheduleDetails = hasCompleteScheduleDetails;
 module.exports._resolveSheetDetails = resolveSheetDetails;
 module.exports._isValidWebhookSecret = isValidWebhookSecret;
 module.exports._writeScheduleRow = writeScheduleRow;
+module.exports._deleteCalendarEvent = deleteCalendarEvent;
+module.exports._deleteScheduleRow = deleteScheduleRow;
+module.exports._setTelegramCommandMenu = setTelegramCommandMenu;
+module.exports._telegramCommands = TELEGRAM_COMMANDS;
