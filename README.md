@@ -10,6 +10,7 @@ This bot automates the daily schedule dispatch process for TCR Classes by fetchi
 
 * **⚡ Always-On Daemon Architecture**
   - Maintains a persistent 24/7 WebSocket connection with WhatsApp Web via Baileys.
+  - Keeps the linked device marked offline on connect (`markOnlineOnConnect: false`) so the primary phone can continue receiving message notifications.
   - Fixes WhatsApp Multi-Device (Signal Protocol encryption) key handshake delays and eliminates the *"Waiting for this message. This may take a while"* issue.
 
 * **📅 Automated Schedule Formatting & Dispatch**

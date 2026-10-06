@@ -350,6 +350,7 @@ async function startBot() {
   const sock = makeWASocket({ 
     version: version,
     auth: state,
+    markOnlineOnConnect: false,
     browser: ["TCR Bot", "Chrome", "120.0.0"]
   });
 
