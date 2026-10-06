@@ -9,7 +9,9 @@ This app provides Telegram commands for viewing and editing the shared TCR class
 - `/list [date or search text]` — list all classes or filter by date, center, course, subject, or faculty.
 - `/create` or `/add` — add a class using comma-separated, pipe-separated, multiline, or key-value input. It inserts a row and writes explicitly to A:H (G is left blank for the dispatch status; the Calendar `iCalUID` is stored in H). Class date/time input is treated as Asia/Kolkata (IST) when creating Calendar events.
 - `/update <row> <field> <value>` — update one field, or provide a complete row.
-- `/delete <row>` — delete a schedule row.
+- `/delete <row>` — delete its linked Calendar event from column H, then delete the schedule row. If deleting the Calendar event fails, the row is retained.
+
+`/start` and `/help` register Telegram's command menu, which includes `/help`. Command failures are reported in the chat with a safe error summary and a reference ID for Vercel logs. If Calendar event creation fails, `/create` reports that it saved the row without the event. Deleting a row directly in Google Sheets does not run bot cleanup; use `/delete` when the linked Calendar event should also be removed.
 
 ## Vercel configuration
 
