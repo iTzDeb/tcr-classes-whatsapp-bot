@@ -5,15 +5,26 @@ const https = require('https');
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const AUTHORIZED_CHAT_ID = process.env.AUTHORIZED_CHAT_ID;
+const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET;
 const DEFAULT_SHEET_TAB = 'Schedule';
+const crypto = require('crypto');
 
 function getMissingConfiguration(env = process.env) {
   return [
     'TELEGRAM_BOT_TOKEN',
     'AUTHORIZED_CHAT_ID',
     'SPREADSHEET_ID',
-    'GOOGLE_SERVICE_ACCOUNT_KEY'
+    'GOOGLE_SERVICE_ACCOUNT_KEY',
+    'TELEGRAM_WEBHOOK_SECRET'
   ].filter(name => !env[name] || !env[name].trim());
+}
+
+function isValidWebhookSecret(suppliedSecret, expectedSecret = process.env.TELEGRAM_WEBHOOK_SECRET || TELEGRAM_WEBHOOK_SECRET) {
+  if (typeof suppliedSecret !== 'string' || !expectedSecret) return false;
+
+  const supplied = Buffer.from(suppliedSecret);
+  const expected = Buffer.from(expectedSecret);
+  return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
 }
 
 function hasCompleteScheduleDetails(details) {
@@ -460,6 +471,11 @@ module.exports = async (req, res) => {
     return;
   }
 
+  if (!isValidWebhookSecret(req.headers?.['x-telegram-bot-api-secret-token'])) {
+    res.status(401).json({ ok: false, error: 'Invalid Telegram webhook secret.' });
+    return;
+  }
+
   try {
     const payload = req.body || {};
 
@@ -898,3 +914,4 @@ module.exports._createScheduleRowValues = createScheduleRowValues;
 module.exports._getMissingConfiguration = getMissingConfiguration;
 module.exports._hasCompleteScheduleDetails = hasCompleteScheduleDetails;
 module.exports._resolveSheetDetails = resolveSheetDetails;
+module.exports._isValidWebhookSecret = isValidWebhookSecret;
