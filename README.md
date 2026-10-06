@@ -170,6 +170,12 @@ If the WhatsApp session disconnects or expires:
 2. An image of the QR code is posted directly to your Telegram chat via Telegram Bot API.
 3. Scan the QR code image from Telegram using your WhatsApp mobile app—no terminal or server access required!
 
+## 🤖 Telegram Schedule Management Bot
+
+The Telegram schedule-management webhook is included under `telegram/` and is deployed separately to Vercel. It reads and edits the same Google Sheet as the WhatsApp scheduler, but runs independently so Telegram commands do not depend on the WhatsApp daemon staying online. See [`telegram/README.md`](telegram/README.md) for Vercel setup, required environment variables, Google service-account permissions, webhook configuration, and test instructions.
+
+Run its local test suite with `cd telegram && npm ci && npm test`. Do not deploy until the exposed Telegram token has been revoked and replaced in Vercel.
+
 ---
 
 ## 📄 License

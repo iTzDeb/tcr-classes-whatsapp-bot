@@ -1,0 +1,13 @@
+{
+  "name": "tcr-telegram-scheduler-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Telegram webhook for managing the TCR class schedule in Google Sheets",
+  "main": "api/index.js",
+  "scripts": {
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "googleapis": "^144.0.0"
+  }
+}
