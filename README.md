@@ -35,7 +35,7 @@ flowchart LR
 Avoid saying that every component “sends schedule announcements”; they do different jobs:
 
 * **WhatsApp group schedule announcements:** `index.js` / the Render daemon is the only component in this repository that sends the scheduled class bundle to WhatsApp groups. It selects rows that GAS returns as not `SENT`, groups them by center/course, and sends them to the group JIDs in the spreadsheet’s `Settings` tab.
-* **Telegram schedule-management bot:** the Vercel app sends command replies to the administrator who invoked `/check`, `/list`, `/create`, `/update`, or `/delete`. It does **not** broadcast class schedules to Telegram groups/channels.
+* **Telegram schedule-management bot:** the Vercel app sends command replies to the administrator who invoked `/check`, `/list`, `/create`, `/update`, `/delete`, or `/reauth`. It does **not** broadcast class schedules to Telegram groups/channels.
 * **GAS in the code below:** does calendar synchronization, calls Render `/dispatch`, marks rows `SENT` after Render’s callback, and sends errors/QR-related alerts. Its `/check` handler replies to the Telegram chat that sent the command. It does **not** broadcast schedule announcements to Telegram channels.
 
 Thus, with the code documented here, the two bots are not both announcing the same class to Telegram audiences. The important shared-state hazard is **Column G (`SENT`)**: Render considers a row complete after a successful send to *at least one* target group. If a class routes to multiple groups and one send fails while another succeeds, the bot still acknowledges all bundled rows to GAS; GAS marks them `SENT`, and the failed group will not get an automatic retry. A later operator edit can clear the status and requeue the row, but may resend it to groups that already received it. Before changing dispatch semantics, consider replacing the single global status with per-destination delivery tracking and idempotency; that is a behavior change and is not implemented here.
@@ -91,10 +91,13 @@ The Vercel Telegram app writes schedule rows directly through the Google Sheets 
 | `/update <row> <field> <value>` | Update one field. Supported fields: Date, Time, Center, Course, Subject, Faculty, Status. Changing a detail field clears G for redispatch. |
 | `/update <row> <full row>` | Update A–G for a complete class. It clears G and leaves H untouched. Review calendar consistency after changing class date/time/details. |
 | `/delete <row>` | Delete the linked Calendar event in H, then permanently delete the schedule row. If Calendar deletion fails, the row is kept. If H is empty or the event is already gone, the bot reports that and deletes the row. |
+| `/reauth` | Show WhatsApp relinking instructions. This Telegram command does not currently call Render or force a new QR code. |
 
 The supplied `/check` smoke test has already been confirmed by the owner. It tests Telegram delivery, webhook execution, and basic Sheets access; it does not prove writes, Calendar access, GAS triggers, Render dispatch, or WhatsApp delivery.
 
 The Telegram `/start` and `/help` commands also register the Telegram command menu, including `/help`, using Bot API `setMyCommands`. Command failures are reported in the chat with a safe error summary and a reference ID for matching Vercel function logs. If Calendar creation fails during `/create`, the bot clearly reports that the schedule row was saved without an event. Calendar/Sheets failures during `/delete` stop the deletion when the event could not be removed, to avoid leaving an orphaned event.
+
+`/reauth` currently only returns instructions; it does not verify WhatsApp's live connection status or trigger the Render daemon. Do not treat its reply as confirmation that a QR was generated or delivered.
 
 **Important:** deleting a row directly in Google Sheets does not call the Telegram bot and cannot automatically remove its Calendar event. Use Telegram `/delete <row>` for linked cleanup. Before deleting a row, check that its row number is current and that H contains the intended event identifier.
 
@@ -215,14 +218,17 @@ The repository’s `Procfile` runs `node index.js`; `package.json` declares an E
 | `GET /` | Returns a short status message; use it as a simple Render health check. |
 | `GET /status` | JSON connection status, processing flag, and timestamp. |
 | `POST /dispatch` | Starts dispatch if WhatsApp is connected and no dispatch is already running. |
+| `POST /reauth` | If connected, reports that it is already connected; otherwise sends a Telegram alert. It does not reset saved credentials, restart the socket, or guarantee a QR code. |
 
 A response `200` from `/dispatch` means accepted/started; `503` means the WhatsApp socket is unavailable; `429` means another dispatch is already running. Review service logs and actual destination groups for delivery confirmation.
 
+The GitHub Actions dispatcher prints the immediate HTTP status and response body and fails the run for non-`200` responses. A `200` confirms only that Render accepted the request; schedule fetching and WhatsApp sends run asynchronously, so check Render logs and Telegram alerts for their result. On an Apps Script fetch failure, the daemon logs the request URL, status/code, response details, timestamp, and error reference; the generic HTTP error alone does not identify the cause.
+
 ### WhatsApp relink / recovery
 
-1. Inspect Render logs and `GET /status`. Confirm whether the connection is logged out or merely reconnecting.
-2. If a QR arrives in the configured Telegram alert chat, open WhatsApp on the account that owns the linked device → **Linked devices** → **Link a device** and scan the fresh QR promptly.
-3. If no QR arrives, check Render Telegram environment variables and logs; use the Render log/terminal only through the account owner’s secure access.
+1. Inspect Render logs and `GET /status`. Confirm whether the connection is logged out or merely reconnecting. `/reauth` in Telegram only displays instructions; `POST /reauth` on Render sends an alert when disconnected but does not reset the session or guarantee a QR.
+2. When Baileys emits a QR, the daemon attempts to send it to the configured Telegram alert chat. Open WhatsApp on the account that owns the linked device → **Linked devices** → **Link a device**, then scan the fresh QR promptly. The QR-image delivery currently uses an external QR rendering service; do not treat QR payloads as non-sensitive.
+3. If the account is logged out and no QR is emitted, the current `/reauth` paths do not initiate a new pairing session. Check Render Telegram environment variables and logs and use the service’s secure operational recovery procedure; do not assume that calling `/reauth` repairs the session.
 4. Do not copy `auth_info/` into Git, send it through chat, or share it with a new operator. If it is exposed, revoke the linked device from the WhatsApp phone and create a fresh link.
 5. Verify the daemon reports connected before dispatching. Use `/status`; send a controlled test to a designated test group before resuming production sends.
 
@@ -283,6 +289,7 @@ Create/manage triggers in Apps Script → **Triggers** (alarm-clock icon). Use o
 | Telegram-created Calendar event is 5h30 later than requested | The old API code treated the entered IST wall time as UTC. The current code converts IST to a UTC instant before creating events. Correct old events manually or update them through Calendar after checking the intended date/time; redeploy alone does not modify existing events. |
 | Calendar duplicates or stale events | Compare Column H with the calendar event ID expected by the code. Telegram `/delete` searches by `iCalUID` and falls back to deleting by event ID, supporting Telegram- and GAS-created references. Validate with a test calendar and confirm times in the Asia/Kolkata calendar timezone. Deleting directly in Sheets does not remove Calendar events. |
 | Render reports no schedule | Check Apps Script Web App `/exec` returns `{classes, settings}`; GAS deployment version; Render’s `APPS_SCRIPT_URL`; tomorrow/date timezone calculations; and Column G status. |
+| Render reports an Apps Script 404 | Check the `APPS_SCRIPT_URL` printed in Render logs, confirm it is the deployed Web App `/exec` URL (not `/dev`), and inspect the response details and active Apps Script deployment. |
 | Render `/dispatch` returns 503 | Check Render is running and `/status` says `whatsappConnected: true`; inspect Baileys reconnect/auth logs and relink if logged out. |
 | Render `/dispatch` returns 429 | A prior dispatch is still processing. Wait and inspect logs before retrying; do not start another send in parallel. |
 | A group did not receive a message but row says SENT | Current acknowledgement is row-wide: one successful recipient can cause all session rows to be marked `SENT`, even if another recipient failed. Check logs/group JIDs and manually coordinate a targeted resend to avoid duplicating groups already served. |
