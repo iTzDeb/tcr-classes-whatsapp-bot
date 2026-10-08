@@ -91,13 +91,13 @@ The Vercel Telegram app writes schedule rows directly through the Google Sheets 
 | `/update <row> <field> <value>` | Update one field. Supported fields: Date, Time, Center, Course, Subject, Faculty, Status. Changing a detail field clears G for redispatch. |
 | `/update <row> <full row>` | Update A–G for a complete class. It clears G and leaves H untouched. Review calendar consistency after changing class date/time/details. |
 | `/delete <row>` | Delete the linked Calendar event in H, then permanently delete the schedule row. If Calendar deletion fails, the row is kept. If H is empty or the event is already gone, the bot reports that and deletes the row. |
-| `/reauth` | Show WhatsApp relinking instructions. This Telegram command does not currently call Render or force a new QR code. |
+| `/reauth` | Ask the Render daemon to start WhatsApp re-authentication when disconnected. If already connected, it reports that status without logging out the active session. |
 
 The supplied `/check` smoke test has already been confirmed by the owner. It tests Telegram delivery, webhook execution, and basic Sheets access; it does not prove writes, Calendar access, GAS triggers, Render dispatch, or WhatsApp delivery.
 
 The Telegram `/start` and `/help` commands also register the Telegram command menu, including `/help`, using Bot API `setMyCommands`. Command failures are reported in the chat with a safe error summary and a reference ID for matching Vercel function logs. If Calendar creation fails during `/create`, the bot clearly reports that the schedule row was saved without an event. Calendar/Sheets failures during `/delete` stop the deletion when the event could not be removed, to avoid leaving an orphaned event.
 
-`/reauth` currently only returns instructions; it does not verify WhatsApp's live connection status or trigger the Render daemon. Do not treat its reply as confirmation that a QR was generated or delivered.
+`/reauth` calls the authenticated Render endpoint. A successful start means the daemon began a fresh pairing attempt; scan the newest QR image delivered to this chat. The bot sends a Telegram confirmation when pairing succeeds and an alert if the two-minute scan window expires. An already connected daemon is left untouched.
 
 **Important:** deleting a row directly in Google Sheets does not call the Telegram bot and cannot automatically remove its Calendar event. Use Telegram `/delete <row>` for linked cleanup. Before deleting a row, check that its row number is current and that H contains the intended event identifier.
 
@@ -125,6 +125,8 @@ Set values in **Vercel Project → Settings → Environment Variables**, not in 
 | `SPREADSHEET_ID` | Yes | Google spreadsheet ID. |
 | `GOOGLE_SERVICE_ACCOUNT_KEY` | Yes | Service account JSON, raw or base64-encoded. Keep it secret. |
 | `GOOGLE_CALENDAR_ID` | No | Calendar ID; code defaults to `primary`. Configure if the service account can write to that calendar. |
+| `RENDER_REAUTH_URL` | Required for `/reauth` | HTTPS URL of the Render daemon’s `/reauth` endpoint, e.g. `https://<render-service>.onrender.com/reauth`. |
+| `RENDER_REAUTH_TOKEN` | Required for `/reauth` | Bearer token shared with Render’s `RENDER_REAUTH_TOKEN`. Store only in Vercel/Render secret settings. |
 
 The code rejects POST requests with missing configuration or an invalid Telegram secret. The production endpoint must be reachable by Telegram. If Vercel Deployment Protection is enabled for the webhook URL, use Vercel’s documented automation-bypass mechanism and include the bypass query parameter in Telegram’s configured webhook URL; **do not paste the bypass secret into this README or a public issue**. The Telegram-specific secret check remains required even when Vercel protection is configured.
 
@@ -197,6 +199,7 @@ GAS runs under the Google account that owns/deploys the script, not the Vercel s
 | `ZOOM_CLIENT_SECRET` | Optional | Zoom OAuth client secret. |
 | `TELEGRAM_BOT_TOKEN` | Optional for alerts | Used for alerts and QR delivery from the Render bot. |
 | `TELEGRAM_CHAT_ID` | Optional for alerts | Recipient for Render alerts and login QR. |
+| `RENDER_REAUTH_TOKEN` | Required for `/reauth` | High-entropy bearer token. Must exactly match Vercel’s `RENDER_REAUTH_TOKEN`; never commit or put it in a URL. |
 
 `CONFIG.APPS_SCRIPT_URL` is currently a literal in `index.js` and must be the deployed Apps Script Web App `/exec` URL. The Render host URL is also referenced by the GAS trigger and keep-alive functions; update both GAS properties/settings when the Render service hostname changes. Never commit a new Apps Script URL if your deployment treats it as an access secret.
 
@@ -218,19 +221,23 @@ The repository’s `Procfile` runs `node index.js`; `package.json` declares an E
 | `GET /` | Returns a short status message; use it as a simple Render health check. |
 | `GET /status` | JSON connection status, processing flag, and timestamp. |
 | `POST /dispatch` | Starts dispatch if WhatsApp is connected and no dispatch is already running. |
-| `POST /reauth` | If connected, reports that it is already connected; otherwise sends a Telegram alert. It does not reset saved credentials, restart the socket, or guarantee a QR code. |
+| `POST /reauth` | Requires `Authorization: Bearer <RENDER_REAUTH_TOKEN>`. If disconnected, clears the saved `auth_info/` pairing state, restarts Baileys, sends QR images directly to Telegram, and waits up to 2 minutes for a successful link. If connected, leaves the existing link untouched. |
 
 A response `200` from `/dispatch` means accepted/started; `503` means the WhatsApp socket is unavailable; `429` means another dispatch is already running. Review service logs and actual destination groups for delivery confirmation.
+
+`POST /reauth` returns `200` if already connected, `202` when pairing starts or is already in progress, `401` for an invalid bearer token, `409` when dispatch is active, and `503` if the endpoint token is not configured. A dispatch request made while WhatsApp is disconnected returns `503` and starts re-authentication automatically. The QR image is generated locally and uploaded to Telegram; QR contents are not sent to an external QR-rendering service. Each QR update is delivered, so scan the latest image. After a successful scan, Telegram confirms the link; if no scan completes within two minutes, the attempt stops and Telegram explains how to retry with `/reauth`.
 
 The GitHub Actions dispatcher prints the immediate HTTP status and response body and fails the run for non-`200` responses. A `200` confirms only that Render accepted the request; schedule fetching and WhatsApp sends run asynchronously, so check Render logs and Telegram alerts for their result. On an Apps Script fetch failure, the daemon logs the request URL, status/code, response details, timestamp, and error reference; the generic HTTP error alone does not identify the cause.
 
 ### WhatsApp relink / recovery
 
-1. Inspect Render logs and `GET /status`. Confirm whether the connection is logged out or merely reconnecting. `/reauth` in Telegram only displays instructions; `POST /reauth` on Render sends an alert when disconnected but does not reset the session or guarantee a QR.
-2. When Baileys emits a QR, the daemon attempts to send it to the configured Telegram alert chat. Open WhatsApp on the account that owns the linked device → **Linked devices** → **Link a device**, then scan the fresh QR promptly. The QR-image delivery currently uses an external QR rendering service; do not treat QR payloads as non-sensitive.
-3. If the account is logged out and no QR is emitted, the current `/reauth` paths do not initiate a new pairing session. Check Render Telegram environment variables and logs and use the service’s secure operational recovery procedure; do not assume that calling `/reauth` repairs the session.
-4. Do not copy `auth_info/` into Git, send it through chat, or share it with a new operator. If it is exposed, revoke the linked device from the WhatsApp phone and create a fresh link.
-5. Verify the daemon reports connected before dispatching. Use `/status`; send a controlled test to a designated test group before resuming production sends.
+1. Inspect Render logs and `GET /status`. Confirm whether the connection is logged out or merely reconnecting.
+2. In the authorized Telegram chat, send `/reauth`. The Vercel deployment must have `RENDER_REAUTH_URL` and `RENDER_REAUTH_TOKEN`; Render must have the matching `RENDER_REAUTH_TOKEN` and Telegram alert settings.
+3. Scan the newest QR photo in WhatsApp → **Settings → Linked Devices → Link a Device**. Pairing succeeds when the daemon reports connected and Telegram confirms it. The scan window is two minutes from the first QR; if it expires, send `/reauth` again.
+4. A dispatch request while disconnected automatically starts the same re-authentication flow and returns HTTP 503 to the caller; wait for the QR/link confirmation before retrying dispatch.
+5. If the endpoint returns 401, compare the Vercel and Render token values without sharing either. If it returns 503, check the Render token setting and redeploy. If no QR photo arrives, inspect Render logs for QR generation or Telegram upload errors and confirm `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
+6. Do not copy `auth_info/` into Git, send it through chat, or share it with a new operator. The authenticated `/reauth` action intentionally deletes this directory to clear stale pairing credentials and start a new link.
+7. Verify the daemon reports connected before dispatching. Use `/status`; send a controlled test to a designated test group before resuming production sends.
 
 The socket sets `markOnlineOnConnect: false` so it does not mark the linked device available on connect. This is intended to let the primary phone continue receiving notifications; it does not eliminate every possible WhatsApp encryption/history-sync issue.
 
@@ -292,6 +299,9 @@ Create/manage triggers in Apps Script → **Triggers** (alarm-clock icon). Use o
 | Render reports an Apps Script 404 | Check the `APPS_SCRIPT_URL` printed in Render logs, confirm it is the deployed Web App `/exec` URL (not `/dev`), and inspect the response details and active Apps Script deployment. |
 | Render `/dispatch` returns 503 | Check Render is running and `/status` says `whatsappConnected: true`; inspect Baileys reconnect/auth logs and relink if logged out. |
 | Render `/dispatch` returns 429 | A prior dispatch is still processing. Wait and inspect logs before retrying; do not start another send in parallel. |
+| Telegram `/reauth` reports it is not configured | Set `RENDER_REAUTH_URL` and `RENDER_REAUTH_TOKEN` in Vercel, and set the same token in Render. Redeploy both services after setting the variables. |
+| Telegram `/reauth` receives 401 or 503 | 401 means Vercel and Render bearer tokens differ; 503 means Render’s token is unset. Check secret names/values in provider settings without copying them into logs or chat. |
+| `/reauth` succeeds but no QR arrives | Check Render logs for the fresh pairing attempt and Telegram QR upload failure. Confirm Render has valid Telegram bot credentials and a reachable authorized `TELEGRAM_CHAT_ID`. |
 | A group did not receive a message but row says SENT | Current acknowledgement is row-wide: one successful recipient can cause all session rows to be marked `SENT`, even if another recipient failed. Check logs/group JIDs and manually coordinate a targeted resend to avoid duplicating groups already served. |
 | GAS Calendar sync does not run after Telegram edit | Expected: Sheets API edits do not invoke Apps Script `onEdit`; use a deliberate time-driven sync/reconciliation. |
 | Trigger fires at unexpected time or only once | Check Apps Script timezone. `armDailyTrigger()` schedules one one-shot run at 16:26 and must be rearmed. |

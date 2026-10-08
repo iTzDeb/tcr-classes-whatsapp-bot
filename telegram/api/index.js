@@ -623,6 +623,58 @@ function getSafeErrorDetails(error) {
   return status ? `${safeMessage} (code ${status})` : safeMessage;
 }
 
+async function requestWhatsAppReauth(fetchImpl = fetch, env = process.env) {
+  const endpoint = env.RENDER_REAUTH_URL;
+  const token = env.RENDER_REAUTH_TOKEN;
+  if (!endpoint || !token) {
+    const error = new Error('WhatsApp re-authentication is not configured. Add the Render endpoint URL and shared re-auth token to Vercel.');
+    error.userMessage = error.message;
+    throw error;
+  }
+
+  let endpointUrl;
+  try {
+    endpointUrl = new URL(endpoint);
+  } catch {
+    const error = new Error('The Render re-auth endpoint must be a valid HTTPS URL ending in /reauth.');
+    error.userMessage = error.message;
+    throw error;
+  }
+  if (endpointUrl.protocol !== 'https:' || !endpointUrl.pathname.replace(/\/+$/, '').endsWith('/reauth')) {
+    const error = new Error('The Render re-auth endpoint must be a valid HTTPS URL ending in /reauth.');
+    error.userMessage = error.message;
+    throw error;
+  }
+
+  const response = await fetchImpl(endpointUrl, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/json'
+    },
+    signal: AbortSignal.timeout(10000)
+  });
+  const responseText = await response.text();
+  let responseBody = {};
+  if (responseText) {
+    try {
+      responseBody = JSON.parse(responseText);
+    } catch {
+      responseBody = {};
+    }
+  }
+
+  if (!response.ok || responseBody.success !== true) {
+    const error = new Error(`Render re-authentication request failed (HTTP ${response.status}).`);
+    error.code = response.status;
+    error.userMessage = response.status === 401
+      ? 'Render rejected the re-authentication request. Verify the shared re-auth token matches in Vercel and Render.'
+      : responseBody.message || error.message;
+    throw error;
+  }
+  return responseBody;
+}
+
 function isAuthorized(chatId, userId) {
   const strChatId = String(chatId);
   const strUserId = String(userId || '');
@@ -1068,15 +1120,15 @@ async function handleDeleteCommand(chatId, argsStr) {
 }
 
 async function handleReauthCommand(chatId) {
-  const msg = `🔐 *WhatsApp Re-authentication Triggered*\n\n` +
-              `If WhatsApp is currently disconnected, you should receive a QR code shortly.\n\n` +
-              `📱 Steps:\n` +
-              `1. Wait for the QR code to arrive in this chat\n` +
-              `2. Open WhatsApp on your phone\n` +
-              `3. Go to Settings → Linked Devices → Link a Device\n` +
-              `4. Scan the QR code with your phone camera\n` +
-              `5. Confirm linking on your phone\n\n` +
-              `If you're already connected, no action is needed. Use /check to verify status.`;
+  const result = await requestWhatsAppReauth();
+  if (result.alreadyConnected) {
+    await sendTelegramMessage(chatId, '✅ WhatsApp is already connected and ready to dispatch.');
+    return;
+  }
+
+  const msg = result.alreadyInProgress
+    ? '⏳ WhatsApp re-authentication is already in progress. Scan the latest QR code sent to this chat.'
+    : '🔐 WhatsApp re-authentication started. The latest QR code will be sent to this chat. Open WhatsApp → Settings → Linked Devices → Link a Device, then scan it within 2 minutes.';
   await sendTelegramMessage(chatId, msg);
 }
 
@@ -1098,3 +1150,4 @@ module.exports._deleteCalendarEvent = deleteCalendarEvent;
 module.exports._deleteScheduleRow = deleteScheduleRow;
 module.exports._setTelegramCommandMenu = setTelegramCommandMenu;
 module.exports._telegramCommands = TELEGRAM_COMMANDS;
+module.exports._requestWhatsAppReauth = requestWhatsAppReauth;

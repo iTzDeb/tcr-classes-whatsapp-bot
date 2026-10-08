@@ -17,7 +17,8 @@ const {
   _writeScheduleRow: writeScheduleRow,
   _deleteCalendarEvent: deleteCalendarEvent,
   _deleteScheduleRow: deleteScheduleRow,
-  _telegramCommands: telegramCommands
+  _telegramCommands: telegramCommands,
+  _requestWhatsAppReauth: requestWhatsAppReauth
 } = telegramWebhook;
 
 console.log('Running search/filter, natural input & chronological sorting tests...');
@@ -277,6 +278,49 @@ async function testCalendarAndRowDeletion() {
   assert.ok(telegramCommands.some(command => command.command === 'delete'));
 }
 
+async function testWhatsAppReauthRequest() {
+  const calls = [];
+  const response = await requestWhatsAppReauth(async (url, options) => {
+    calls.push({ url: String(url), options });
+    return {
+      ok: true,
+      status: 202,
+      text: async () => JSON.stringify({ success: true, started: true })
+    };
+  }, {
+    RENDER_REAUTH_URL: 'https://tcr-bot.example/reauth',
+    RENDER_REAUTH_TOKEN: 'shared-secret'
+  });
+
+  assert.deepStrictEqual(response, { success: true, started: true });
+  assert.strictEqual(calls[0].url, 'https://tcr-bot.example/reauth');
+  assert.strictEqual(calls[0].options.method, 'POST');
+  assert.strictEqual(calls[0].options.headers.Authorization, 'Bearer shared-secret');
+  assert.strictEqual(calls[0].options.signal.aborted, false);
+  await assert.rejects(
+    () => requestWhatsAppReauth(async () => { throw new Error('fetch should not run'); }, {}),
+    /Add the Render endpoint URL and shared re-auth token to Vercel/
+  );
+  await assert.rejects(
+    () => requestWhatsAppReauth(async () => ({
+      ok: false,
+      status: 401,
+      text: async () => JSON.stringify({ success: false, message: 'Unauthorized.' })
+    }), {
+      RENDER_REAUTH_URL: 'https://tcr-bot.example/reauth',
+      RENDER_REAUTH_TOKEN: 'wrong-secret'
+    }),
+    error => error.userMessage.includes('Verify the shared re-auth token matches')
+  );
+  await assert.rejects(
+    () => requestWhatsAppReauth(async () => {}, {
+      RENDER_REAUTH_URL: 'http://tcr-bot.example/reauth',
+      RENDER_REAUTH_TOKEN: 'shared-secret'
+    }),
+    /valid HTTPS URL ending in \/reauth/
+  );
+}
+
 assert.deepStrictEqual(
   getMissingConfiguration({}),
   ['TELEGRAM_BOT_TOKEN', 'AUTHORIZED_CHAT_ID', 'SPREADSHEET_ID', 'GOOGLE_SERVICE_ACCOUNT_KEY', 'TELEGRAM_WEBHOOK_SECRET'],
@@ -411,7 +455,8 @@ Promise.all([
   testHealthEndpoint(),
   testOperationalGuards(),
   testExplicitScheduleRowWrite(),
-  testCalendarAndRowDeletion()
+  testCalendarAndRowDeletion(),
+  testWhatsAppReauthRequest()
 ])
   .then(() => console.log('All Telegram schedule bot tests passed successfully!'))
   .catch(error => {

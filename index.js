@@ -1,7 +1,9 @@
 import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestWaWebVersion } from '@whiskeysockets/baileys';
-import qrcode from 'qrcode-terminal';
+import QRCode from 'qrcode';
 import axios from 'axios';
 import express from 'express';
+import { rm } from 'node:fs/promises';
+import { timingSafeEqual } from 'node:crypto';
 
 // ============================================================================
 // 1. GLOBAL CONFIGURATION
@@ -22,11 +24,14 @@ const CONFIG = {
     BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
     CHAT_ID: process.env.TELEGRAM_CHAT_ID
   },
+  REAUTH_TOKEN: process.env.RENDER_REAUTH_TOKEN,
+  AUTH_DIRECTORY: 'auth_info',
 
   TIMINGS: {
     MESSAGE_DELAY_MS: 5000,
     API_BREATHER_MS: 1000,
-    ZOOM_RETRY_MS: 2000
+    ZOOM_RETRY_MS: 2000,
+    QR_SCAN_TIMEOUT_MS: 2 * 60 * 1000
   }
 };
 
@@ -60,20 +65,16 @@ async function sendTelegramAlert(text) {
 
 async function sendTelegramQR(qrCodeData) {
   if (!CONFIG.TELEGRAM.BOT_TOKEN || !CONFIG.TELEGRAM.CHAT_ID) {
-    console.warn("Telegram credentials missing. Cannot send QR alert.");
-    return;
+    throw new Error('Telegram credentials missing. Cannot send QR alert.');
   }
-  try {
-    const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(qrCodeData)}`;
-    await axios.post(`https://api.telegram.org/bot${CONFIG.TELEGRAM.BOT_TOKEN}/sendPhoto`, {
-      chat_id: CONFIG.TELEGRAM.CHAT_ID,
-      photo: qrImageUrl,
-      caption: '📱 *TCR Bot WhatsApp Re-authentication Required*\n\nPlease scan this QR code with your WhatsApp app to link the session.'
-    });
-    console.log("Sent QR Code image to Telegram successfully!");
-  } catch (e) {
-    console.error("Failed to send QR Code to Telegram:", e?.response?.data || e.message);
-  }
+
+  const image = await QRCode.toBuffer(qrCodeData, { type: 'png', width: 400, margin: 2 });
+  const form = new FormData();
+  form.append('chat_id', String(CONFIG.TELEGRAM.CHAT_ID));
+  form.append('caption', 'WhatsApp link required. Scan this current QR in WhatsApp → Linked Devices. The QR expires; use the newest image.');
+  form.append('photo', new Blob([image], { type: 'image/png' }), 'whatsapp-login-qr.png');
+  await axios.post(`https://api.telegram.org/bot${CONFIG.TELEGRAM.BOT_TOKEN}/sendPhoto`, form);
+  console.log('Sent locally generated QR image to Telegram.');
 }
 
 function formatZoomStartTime(dateStr, timeStr) {
@@ -187,9 +188,10 @@ async function createZoomMeeting(accessToken, topic, startTime, durationMins) {
 async function processDailySchedules(sock) {
   try {
     if (!isConnected) {
-      const alert = '⚠️ *Schedule Dispatch Pre-Check Failed*\nWhatsApp is not connected. Sending QR code for re-authentication...';
-      console.warn('Pre-dispatch check failed: WhatsApp not connected');
+      const alert = '⚠️ *Schedule Dispatch Pre-Check Failed*\nWhatsApp is not connected. Starting re-authentication...';
+      console.warn(`[${new Date().toISOString()}] Pre-dispatch check failed: WhatsApp not connected.`);
       await sendTelegramAlert(alert);
+      await beginReauthentication(true);
       return;
     }
 
@@ -368,54 +370,150 @@ async function processDailySchedules(sock) {
 let activeSocket = null;
 let isConnected = false;
 let isProcessing = false;
+let botStartPromise = null;
+let socketGeneration = 0;
+let reconnectTimer = null;
+let qrScanTimeout = null;
+let reauthInProgress = false;
 
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info');
-  
-  const { version, isLatest } = await fetchLatestWaWebVersion();
-  console.log(`Using WA v${version.join('.')}, isLatest: ${isLatest}`);
-  
-  const sock = makeWASocket({ 
-    version: version,
-    auth: state,
-    markOnlineOnConnect: false,
-    browser: ["TCR Bot", "Chrome", "120.0.0"]
-  });
+  if (botStartPromise) return botStartPromise;
 
-  activeSocket = sock;
+  const generation = socketGeneration;
+  botStartPromise = (async () => {
+    const { state, saveCreds } = await useMultiFileAuthState(CONFIG.AUTH_DIRECTORY);
+    const { version, isLatest } = await fetchLatestWaWebVersion();
+    if (generation !== socketGeneration) return;
+    console.log(`Using WA v${version.join('.')}, isLatest: ${isLatest}`);
 
-  sock.ev.on('creds.update', saveCreds);
+    const sock = makeWASocket({
+      version,
+      auth: state,
+      markOnlineOnConnect: false,
+      browser: ['TCR Bot', 'Chrome', '120.0.0']
+    });
+    activeSocket = sock;
 
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-    const timestamp = new Date().toISOString();
-    
-    if (qr) {
-        console.log(`[${timestamp}] 🔐 QR Code generated and sending to Telegram...`);
-        qrcode.generate(qr, { small: true });
-        await sendTelegramQR(qr);
-    }
-    
-    if (connection === 'close') {
-      isConnected = false;
-      const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      const reason = lastDisconnect.error?.output?.statusCode === DisconnectReason.loggedOut ? 'LOGGED_OUT' : 'NETWORK_ERROR';
-      console.log(`[${timestamp}] ❌ Connection closed. Reason: ${reason}. Will reconnect: ${shouldReconnect}`);
-      if (shouldReconnect) {
-        console.log(`[${timestamp}] ⏳ Attempting to reconnect in 3 seconds...`);
-        setTimeout(startBot, 3000);
-      } else {
-        const logoutAlert = `[${timestamp}] ⚠️ *WhatsApp Session Logged Out*\nPlease scan the QR code sent separately to reconnect.`;
-        console.warn(logoutAlert);
-        await sendTelegramAlert('⚠️ *WhatsApp Disconnected*\nSession logged out. Scan QR code to reconnect.');
+    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('connection.update', async (update) => {
+      if (sock !== activeSocket) return;
+
+      const { connection, lastDisconnect, qr } = update;
+      const timestamp = new Date().toISOString();
+
+      if (qr) {
+        console.log(`[${timestamp}] QR Code generated; sending directly to Telegram.`);
+        if (!qrScanTimeout) {
+          qrScanTimeout = setTimeout(async () => {
+            const expiredSocket = activeSocket;
+            activeSocket = null;
+            isConnected = false;
+            reauthInProgress = false;
+            socketGeneration++;
+            clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+            expiredSocket?.end(new Error('WhatsApp QR scan timed out'));
+            qrScanTimeout = null;
+            console.warn(`[${new Date().toISOString()}] WhatsApp QR scan window expired.`);
+            await sendTelegramAlert('⏱️ WhatsApp was not linked within 2 minutes. The QR session expired. Send /reauth to try again.');
+          }, CONFIG.TIMINGS.QR_SCAN_TIMEOUT_MS);
+          qrScanTimeout.unref?.();
+        }
+        try {
+          await sendTelegramQR(qr);
+        } catch (error) {
+          console.error(`[${timestamp}] Failed to deliver WhatsApp QR to Telegram:`, error.message);
+          await sendTelegramAlert(`⚠️ Could not deliver the WhatsApp QR code to Telegram: ${error.message}`);
+        }
       }
-    } else if (connection === 'open') {
-      isConnected = true;
-      console.log(`[${timestamp}] ✅ Connected to WhatsApp Web! Daemon is active and holding WebSocket 24/7.`);
-    } else if (connection === 'connecting') {
-      console.log(`[${timestamp}] 🔄 Connecting to WhatsApp...`);
-    }
-  });
+
+      if (connection === 'close') {
+        isConnected = false;
+        const statusCode = lastDisconnect.error?.output?.statusCode;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        const reason = shouldReconnect ? 'NETWORK_ERROR' : 'LOGGED_OUT';
+        console.log(`[${timestamp}] Connection closed. Reason: ${reason}. Will reconnect: ${shouldReconnect || reauthInProgress}`);
+        if (shouldReconnect || reauthInProgress) {
+          if (!reconnectTimer) {
+            reconnectTimer = setTimeout(() => {
+              reconnectTimer = null;
+              startBot().catch(async (error) => {
+                console.error(`[${new Date().toISOString()}] WhatsApp reconnect failed:`, error.message);
+                await sendTelegramAlert(`⚠️ WhatsApp reconnect failed: ${error.message}`);
+              });
+            }, 3000);
+          }
+        } else {
+          await sendTelegramAlert('⚠️ WhatsApp logged out. Starting a fresh QR pairing session now.');
+          beginReauthentication(true).catch(async (error) => {
+            console.error(`[${new Date().toISOString()}] Automatic WhatsApp re-authentication failed:`, error.message);
+            await sendTelegramAlert(`🚨 Automatic WhatsApp re-authentication failed: ${error.message}`);
+          });
+        }
+      } else if (connection === 'open') {
+        isConnected = true;
+        const wasReauthenticating = reauthInProgress || Boolean(qrScanTimeout);
+        clearTimeout(qrScanTimeout);
+        qrScanTimeout = null;
+        reauthInProgress = false;
+        console.log(`[${timestamp}] Connected to WhatsApp Web.`);
+        if (wasReauthenticating) {
+          await sendTelegramAlert('✅ WhatsApp has been linked successfully and is ready for dispatch.');
+        }
+      } else if (connection === 'connecting') {
+        console.log(`[${timestamp}] Connecting to WhatsApp...`);
+      }
+    });
+  })();
+
+  try {
+    await botStartPromise;
+  } finally {
+    botStartPromise = null;
+  }
+}
+
+function hasValidReauthToken(req) {
+  const suppliedToken = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+  if (!CONFIG.REAUTH_TOKEN || !suppliedToken) return false;
+  const supplied = Buffer.from(suppliedToken);
+  const expected = Buffer.from(CONFIG.REAUTH_TOKEN);
+  return supplied.length === expected.length && timingSafeEqual(supplied, expected);
+}
+
+async function beginReauthentication(force = false) {
+  if (isConnected) return { alreadyConnected: true };
+  if (reauthInProgress) return { alreadyInProgress: true };
+  if (isProcessing && !force) {
+    const error = new Error('A schedule dispatch is in progress. Wait for it to finish before re-authenticating.');
+    error.statusCode = 409;
+    throw error;
+  }
+
+  reauthInProgress = true;
+  clearTimeout(qrScanTimeout);
+  qrScanTimeout = null;
+  socketGeneration++;
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+
+  const previousSocket = activeSocket;
+  activeSocket = null;
+  isConnected = false;
+  previousSocket?.end(new Error('Starting WhatsApp re-authentication'));
+
+  try {
+    if (botStartPromise) await botStartPromise;
+    await rm(CONFIG.AUTH_DIRECTORY, { recursive: true, force: true });
+    await sendTelegramAlert('🔐 WhatsApp re-authentication started. A fresh QR code will be sent here. Scan the latest QR within 2 minutes.');
+    await startBot();
+    return { started: true };
+  } catch (error) {
+    reauthInProgress = false;
+    clearTimeout(qrScanTimeout);
+    qrScanTimeout = null;
+    throw error;
+  }
 }
 
 // ============================================================================
@@ -432,18 +530,28 @@ app.get('/status', (req, res) => {
   res.json({
     status: 'online',
     whatsappConnected: isConnected,
+    reauthInProgress,
     isProcessing: isProcessing,
     timestamp: new Date().toISOString()
   });
 });
 
 app.all('/dispatch', async (req, res) => {
-  if (!activeSocket || !isConnected) {
-    return res.status(503).json({ success: false, message: 'WhatsApp socket is not connected yet.' });
-  }
-
   if (isProcessing) {
     return res.status(429).json({ success: false, message: 'Schedule processing is already in progress.' });
+  }
+
+  if (!activeSocket || !isConnected) {
+    const timestamp = new Date().toISOString();
+    console.warn(`[${timestamp}] Dispatch requested while WhatsApp is disconnected; starting re-authentication.`);
+    beginReauthentication().catch(async (error) => {
+      console.error(`[${new Date().toISOString()}] Dispatch-triggered re-authentication failed:`, error.message);
+      await sendTelegramAlert(`🚨 Dispatch could not start WhatsApp re-authentication: ${error.message}`);
+    });
+    return res.status(503).json({
+      success: false,
+      message: 'WhatsApp is not connected. Re-authentication has been started; scan the QR sent to Telegram.'
+    });
   }
 
   isProcessing = true;
@@ -462,23 +570,40 @@ app.all('/dispatch', async (req, res) => {
   }
 });
 
-app.all('/reauth', async (req, res) => {
+app.post('/reauth', async (req, res) => {
   const timestamp = new Date().toISOString();
-  console.log(`[${timestamp}] /reauth endpoint called. Current connection state: ${isConnected ? 'connected' : 'disconnected'}`);
-  
-  if (isConnected) {
-    const msg = '✅ WhatsApp is already connected and ready to dispatch.';
-    console.log(`[${timestamp}] ${msg}`);
-    return res.json({ success: true, message: msg });
+  if (!CONFIG.REAUTH_TOKEN) {
+    console.error(`[${timestamp}] RENDER_REAUTH_TOKEN is not configured.`);
+    return res.status(503).json({ success: false, message: 'Re-authentication is not configured on this service.' });
+  }
+  if (!hasValidReauthToken(req)) {
+    console.warn(`[${timestamp}] Rejected unauthorized /reauth request.`);
+    return res.status(401).json({ success: false, message: 'Unauthorized.' });
   }
 
-  const msg = `⏳ WhatsApp re-authentication in progress. Check your Telegram for a QR code. You have 2 minutes to scan it.`;
-  console.log(`[${timestamp}] ${msg}`);
-  await sendTelegramAlert(`🔐 *WhatsApp Re-authentication Initiated*\n${msg}\n\n📱 Scan the QR code with your WhatsApp app to reconnect.`);
-  res.json({ success: true, message: msg });
+  console.log(`[${timestamp}] Authorized /reauth endpoint request. WhatsApp connected: ${isConnected}`);
+  if (isConnected) {
+    return res.json({ success: true, alreadyConnected: true, message: 'WhatsApp is already connected and ready to dispatch.' });
+  }
+
+  try {
+    const result = await beginReauthentication();
+    return res.status(202).json({
+      success: true,
+      ...result,
+      message: 'WhatsApp re-authentication started. Scan the newest QR sent to Telegram within 2 minutes.'
+    });
+  } catch (error) {
+    const statusCode = error.statusCode || 500;
+    console.error(`[${timestamp}] Re-authentication start failed:`, error.message);
+    return res.status(statusCode).json({ success: false, message: error.message });
+  }
 });
 
 app.listen(CONFIG.PORT, () => {
   console.log(`🚀 TCR Bot server running on port ${CONFIG.PORT}`);
-  startBot();
+  startBot().catch(async (error) => {
+    console.error(`[${new Date().toISOString()}] WhatsApp startup failed:`, error.message);
+    await sendTelegramAlert(`🚨 WhatsApp startup failed: ${error.message}`);
+  });
 });
