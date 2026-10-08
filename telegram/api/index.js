@@ -15,7 +15,8 @@ const TELEGRAM_COMMANDS = [
   { command: 'list', description: 'View or search the class schedule' },
   { command: 'create', description: 'Add a class to the schedule' },
   { command: 'update', description: 'Update a schedule row' },
-  { command: 'delete', description: 'Delete a class and its linked event' }
+  { command: 'delete', description: 'Delete a class and its linked event' },
+  { command: 'reauth', description: 'Manually trigger WhatsApp re-authentication' }
 ];
 
 function getMissingConfiguration(env = process.env) {
@@ -709,6 +710,8 @@ async function handleTelegramCommand(chatId, text) {
       `Delete row. Example: \`/delete 15\`\n\n` +
       `📌 */check*\n` +
       `Check bot online status and pending dispatches.\n\n` +
+      `📌 */reauth*\n` +
+      `Manually trigger WhatsApp re-authentication. Use this if you logged out WhatsApp or need to reconnect.\n\n` +
       `🗑️ When you use */delete*, the bot also deletes the linked Calendar event stored in column H. Deleting a row directly in Sheets does not trigger this cleanup.`;
 
     try {
@@ -762,6 +765,11 @@ async function handleTelegramCommand(chatId, text) {
 
     if (command === '/delete') {
       await handleDeleteCommand(chatId, argsStr);
+      return;
+    }
+
+    if (command === '/reauth') {
+      await handleReauthCommand(chatId);
       return;
     }
 
@@ -1057,6 +1065,19 @@ async function handleDeleteCommand(chatId, argsStr) {
     'not-linked': 'No Calendar event ID was present in column H; only the schedule row was deleted.'
   }[calendarDeleteResult];
   await sendTelegramMessage(chatId, `🗑️ *Class Row ${rowNum} Deleted Successfully!*\n${calendarStatus}`);
+}
+
+async function handleReauthCommand(chatId) {
+  const msg = `🔐 *WhatsApp Re-authentication Triggered*\n\n` +
+              `If WhatsApp is currently disconnected, you should receive a QR code shortly.\n\n` +
+              `📱 Steps:\n` +
+              `1. Wait for the QR code to arrive in this chat\n` +
+              `2. Open WhatsApp on your phone\n` +
+              `3. Go to Settings → Linked Devices → Link a Device\n` +
+              `4. Scan the QR code with your phone camera\n` +
+              `5. Confirm linking on your phone\n\n` +
+              `If you're already connected, no action is needed. Use /check to verify status.`;
+  await sendTelegramMessage(chatId, msg);
 }
 
 // Export internal functions for unit testing

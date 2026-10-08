@@ -18,8 +18,26 @@ jobs:
           BOT_SERVER_URL: ${{ secrets.BOT_SERVER_URL }}
         run: |
           if [ -z "$BOT_SERVER_URL" ]; then
-            echo "BOT_SERVER_URL secret not set. Skipping dispatch trigger."
-            exit 0
+            echo "❌ BOT_SERVER_URL secret not set. Cannot trigger dispatch."
+            exit 1
           fi
-          echo "Sending trigger request to $BOT_SERVER_URL/dispatch..."
-          curl -s -X POST "$BOT_SERVER_URL/dispatch"
+          
+          echo "🚀 Sending dispatch trigger to $BOT_SERVER_URL/dispatch..."
+          echo "Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$BOT_SERVER_URL/dispatch")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          
+          echo "Response Status: $HTTP_CODE"
+          echo "Response Body: $BODY"
+          
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✅ Dispatch trigger sent successfully!"
+            exit 0
+          else
+            echo "❌ Dispatch trigger failed with HTTP $HTTP_CODE"
+            echo "Check Render logs at: https://dashboard.render.com/d/srv-YOUR-SERVICE-ID/logs"
+            exit 1
+          fi
+
