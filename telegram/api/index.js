@@ -525,7 +525,7 @@ function setTelegramCommandMenu() {
 }
 
 function getSafeErrorDetails(error) {
-  const status = error.code || error.response?.status;
+  const status = error.code || error.statusCode || error.response?.status;
   const message = String(error.message || 'Unknown error').replace(/[\r\n`]/g, ' ').slice(0, 240);
   const safeMessage = message.replace(/([_*[\]()])/g, '\\$1');
   return status ? `${safeMessage} (code ${status})` : safeMessage;
