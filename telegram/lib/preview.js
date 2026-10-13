@@ -148,13 +148,13 @@ function scheduleDateKey(value) {
   return parts ? parts.map((part, index) => index === 0 ? String(part) : String(part).padStart(2, '0')).join('-') : '';
 }
 
-function todayInIndia() {
+function indiaDateKey(offsetDays = 0) {
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'Asia/Kolkata',
     year: 'numeric',
     month: '2-digit',
     day: '2-digit'
-  }).formatToParts(new Date());
+  }).formatToParts(new Date(Date.now() + offsetDays * 24 * 60 * 60 * 1000));
   const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
   return `${values.year}-${values.month}-${values.day}`;
 }
