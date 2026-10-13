@@ -8,7 +8,8 @@ const {
   answerCallbackQuery,
   fetchPendingRows,
   groupPendingRows,
-  callbackSignature
+  callbackSignature,
+  formatScheduleDate
 } = require('../lib/preview');
 const { getGoogleAuth } = require('../lib/googleAuth');
 
@@ -599,7 +600,14 @@ function isValidCronAuthorization(authorization, expectedSecret = process.env.CR
 }
 
 async function handlePreviewCallback(callbackQuery) {
-  const match = String(callbackQuery.data || '').match(/^(prepare|sent):(\d+):([a-f0-9]{8})$/);
+  const data = String(callbackQuery.data || '');
+
+  if (data === 'noop') {
+    await answerCallbackQuery(callbackQuery.id, 'Message too long for one-tap sending. Copy the text manually.');
+    return;
+  }
+
+  const match = data.match(/^(prepare|sent):(\d+):([a-f0-9]{8})$/);
   if (!match) {
     await answerCallbackQuery(callbackQuery.id, 'This preview action is invalid.');
     return;
@@ -612,6 +620,9 @@ async function handlePreviewCallback(callbackQuery) {
     return;
   }
 
+  const chatId = callbackQuery.message?.chat?.id;
+  const originalMessageId = callbackQuery.message?.message_id;
+
   if (match[1] === 'prepare') {
     await prepareZoomSend(group.rowIndices);
     await answerCallbackQuery(callbackQuery.id, 'Zoom links prepared. The WhatsApp message is ready.');
@@ -620,6 +631,22 @@ async function handlePreviewCallback(callbackQuery) {
 
   await markRowsSent(group.rowIndices);
   await answerCallbackQuery(callbackQuery.id, 'Schedule rows marked as sent.');
+
+  if (chatId) {
+    const rowList = group.rowIndices.join(', ');
+    const confirmation =
+      `✅ *Marked as sent*\n` +
+      `📚 *${group.course}* · ${formatScheduleDate(group.date)}\n` +
+      `📍 Rows: \`${rowList}\``;
+    try {
+      await sendTelegramMessage(chatId, confirmation, {
+        reply_to_message_id: originalMessageId,
+        allow_sending_without_reply: true
+      });
+    } catch (err) {
+      console.error('Mark-as-sent confirmation failed:', err.message);
+    }
+  }
 }
 
 // Vercel Serverless Entry Point
