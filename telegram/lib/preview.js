@@ -204,6 +204,29 @@ async function fetchPendingRows() {
   });
 }
 
+async function fetchAllRows() {
+  if (!SPREADSHEET_ID) throw new Error('SPREADSHEET_ID is not configured.');
+  const sheets = getSheetsClient();
+  const sheet = await getSheetDetails(sheets);
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `'${sheet.title.replace(/'/g, "''")}'!A1:I`
+  });
+  const rows = response.data.values || [];
+  return rows.slice(1).map((values, index) => ({
+    rowIndex: index + 2,
+    date: String(values[0] || '').trim(),
+    time: String(values[1] || '').trim(),
+    center: String(values[2] || '').trim(),
+    course: String(values[3] || '').trim(),
+    subject: String(values[4] || '').trim(),
+    faculty: String(values[5] || '').trim(),
+    status: String(values[6] || '').trim().toUpperCase(),
+    eventId: String(values[7] || '').trim(),
+    zoomUrl: String(values[8] || '').trim()
+  })).filter(row => row.date);
+}
+
 function groupPendingRows(rows) {
   const groups = new Map();
   for (const row of rows) {
@@ -389,9 +412,12 @@ module.exports = {
   sendTelegramMessage,
   answerCallbackQuery,
   fetchPendingRows,
+  fetchAllRows,
   groupPendingRows,
   callbackSignature,
   formatGroupMessage,
   formatScheduleDate,
+  scheduleDateKey,
+  indiaDateKey,
   buildKeyboard
 };
