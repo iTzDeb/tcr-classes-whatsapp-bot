@@ -424,6 +424,49 @@ function setTelegramCommandMenu() {
   });
 }
 
+function setTelegramMenuButton() {
+  const data = JSON.stringify({
+    menu_button: { type: 'commands' }
+  });
+
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: 'api.telegram.org',
+      port: 443,
+      path: `/bot${TELEGRAM_BOT_TOKEN}/setChatMenuButton`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(data)
+      }
+    };
+
+    const req = https.request(options, response => {
+      let body = '';
+      response.on('data', chunk => body += chunk);
+      response.on('end', () => {
+        let result;
+        try {
+          result = JSON.parse(body);
+        } catch {
+          reject(new Error('Telegram returned an invalid response while setting the menu button.'));
+          return;
+        }
+        if (response.statusCode < 200 || response.statusCode >= 300 || result.ok !== true) {
+          reject(new Error(`Telegram menu button setup failed: ${result.description || response.statusCode}`));
+          return;
+        }
+        resolve(result.result);
+      });
+    });
+
+    req.on('error', reject);
+    req.setTimeout(10000, () => req.destroy(new Error('Telegram menu button setup timed out.')));
+    req.write(data);
+    req.end();
+  });
+}
+
 function getSafeErrorDetails(error) {
   const status = error.code || error.statusCode || error.response?.status;
   const message = String(error.message || 'Unknown error').replace(/[\r\n`]/g, ' ').slice(0, 240);
@@ -598,10 +641,11 @@ async function handleTelegramCommand(chatId, text) {
 
     try {
       await setTelegramCommandMenu();
+      await setTelegramMenuButton();
     } catch (error) {
       const referenceId = crypto.randomUUID();
-      console.error('Telegram command menu setup error:', { referenceId, message: error.message });
-      await sendTelegramMessage(chatId, `⚠️ The help text is available, but Telegram could not refresh its command menu. Try /help again later. Reference: \`${referenceId}\``);
+      console.error('Telegram menu setup error:', { referenceId, message: error.message });
+      await sendTelegramMessage(chatId, `⚠️ The help text is available, but Telegram could not refresh its menu. Try /help again later. Reference: \`${referenceId}\``);
     }
     await sendTelegramMessage(chatId, helpMsg);
     return;
@@ -965,5 +1009,6 @@ module.exports._writeScheduleRow = writeScheduleRow;
 module.exports._deleteCalendarEvent = deleteCalendarEvent;
 module.exports._deleteScheduleRow = deleteScheduleRow;
 module.exports._setTelegramCommandMenu = setTelegramCommandMenu;
+module.exports._setTelegramMenuButton = setTelegramMenuButton;
 module.exports._telegramCommands = TELEGRAM_COMMANDS;
 module.exports._isValidCronAuthorization = isValidCronAuthorization;
