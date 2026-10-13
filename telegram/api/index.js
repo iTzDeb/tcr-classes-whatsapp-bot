@@ -7,9 +7,12 @@ const {
   sendTelegramMessage,
   answerCallbackQuery,
   fetchPendingRows,
+  fetchAllRows,
   groupPendingRows,
   callbackSignature,
-  formatScheduleDate
+  formatScheduleDate,
+  scheduleDateKey,
+  indiaDateKey
 } = require('../lib/preview');
 const { getGoogleAuth } = require('../lib/googleAuth');
 
@@ -20,16 +23,22 @@ const AUTHORIZED_CHAT_ID = process.env.AUTHORIZED_CHAT_ID;
 const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET;
 const DEFAULT_SHEET_TAB = 'Schedule';
 const crypto = require('crypto');
+
 const TELEGRAM_COMMANDS = [
-  { command: 'start', description: 'Open the bot help menu' },
-  { command: 'help', description: 'Show available commands and examples' },
-  { command: 'check', description: 'Check pending classes and bot access' },
-  { command: 'list', description: 'View or search the class schedule' },
-  { command: 'create', description: 'Add a class to the schedule' },
-  { command: 'update', description: 'Update a schedule row' },
-  { command: 'delete', description: 'Delete a class and its linked event' },
-  { command: 'preview', description: 'Prepare upcoming class messages for WhatsApp' },
-  { command: 'reauth', description: 'Manually trigger WhatsApp re-authentication' }
+  { command: 'start',    description: 'Open the bot help menu' },
+  { command: 'help',     description: 'Show available commands and examples' },
+  { command: 'status',   description: 'System status and pending counts' },
+  { command: 'preview',  description: 'Prepare tomorrow\'s WhatsApp messages' },
+  { command: 'today',    description: 'List today\'s classes' },
+  { command: 'tomorrow', description: 'List tomorrow\'s classes' },
+  { command: 'pending',  description: 'List all unsent classes (any date)' },
+  { command: 'list',     description: 'Search the full schedule' },
+  { command: 'faculty',  description: 'List classes by faculty name' },
+  { command: 'create',   description: 'Add a class to the schedule' },
+  { command: 'update',   description: 'Update a schedule row' },
+  { command: 'resend',   description: 'Reset a row for resending' },
+  { command: 'undo',     description: 'Unmark a row as sent' },
+  { command: 'delete',   description: 'Delete a class and its linked event' }
 ];
 
 function getMissingConfiguration(env = process.env) {
@@ -44,7 +53,6 @@ function getMissingConfiguration(env = process.env) {
 
 function isValidWebhookSecret(suppliedSecret, expectedSecret = process.env.TELEGRAM_WEBHOOK_SECRET || TELEGRAM_WEBHOOK_SECRET) {
   if (typeof suppliedSecret !== 'string' || !expectedSecret) return false;
-
   const supplied = Buffer.from(suppliedSecret);
   const expected = Buffer.from(expectedSecret);
   return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
@@ -55,7 +63,7 @@ function hasCompleteScheduleDetails(details) {
     .every(field => String(details[field] || '').trim().length > 0);
 }
 
-// --- Utility & Date Parsing Helpers (Defined at Top Level) ---
+// --- Utility & Date Parsing Helpers ---
 
 function normalizeText(text) {
   if (!text) return '';
@@ -72,7 +80,6 @@ function normalizeText(text) {
     .replace(/\baugust\b/g, 'aug')
     .replace(/\bnovember\b/g, 'nov')
     .replace(/\bdecember\b/g, 'dec')
-    // Strip leading zeros from day numbers / numeric tokens (e.g., "01" -> "1", "06" -> "6")
     .replace(/\b0([1-9])\b/g, '$1');
 }
 
@@ -85,7 +92,6 @@ function matchesFilter(dateStr, fullRowText, filterText) {
   const monthTokens = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
   const hasMonthToken = tokens.some(t => monthTokens.includes(t));
 
-  // If filter contains month name (e.g. "oct"), match date strictly against dateStr
   if (hasMonthToken) {
     return tokens.every(token => {
       const escaped = token.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
@@ -94,7 +100,6 @@ function matchesFilter(dateStr, fullRowText, filterText) {
     });
   }
 
-  // General query (e.g. "Laxmi Nagar" or "CLAT")
   const normRow = normalizeText(fullRowText);
   if (normRow.includes(normFilter)) return true;
 
@@ -110,67 +115,46 @@ function matchesFilter(dateStr, fullRowText, filterText) {
 
 function parseDateStrToVal(dateStr) {
   if (!dateStr) return 0;
-  // Clean string and strip ordinal suffixes like 1st, 2nd, 3rd, 4th
   const str = String(dateStr).trim().toLowerCase().replace(/(\d+)(st|nd|rd|th)/g, '$1');
   const months = {
-    jan: 0, january: 0,
-    feb: 1, february: 1,
-    mar: 2, march: 2,
-    apr: 3, april: 3,
-    may: 4,
-    jun: 5, june: 5,
-    jul: 6, july: 6,
-    aug: 7, august: 7,
-    sep: 8, sept: 8, september: 8,
-    oct: 9, october: 9,
-    nov: 10, november: 10,
-    dec: 11, december: 11
+    jan: 0, january: 0, feb: 1, february: 1, mar: 2, march: 2, apr: 3, april: 3,
+    may: 4, jun: 5, june: 5, jul: 6, july: 6, aug: 7, august: 7,
+    sep: 8, sept: 8, september: 8, oct: 9, october: 9,
+    nov: 10, november: 10, dec: 11, december: 11
   };
-
   const defaultYear = new Date().getFullYear();
 
-  // Pattern 1: "06 Sept 2026", "6 Oct", "1 Oct 2026"
   const dayMonthMatch = str.match(/^(\d{1,2})\s+([a-z]+)(?:\s+(\d{2,4}))?$/i);
   if (dayMonthMatch) {
     const day = parseInt(dayMonthMatch[1], 10);
     const mStr = dayMonthMatch[2].toLowerCase();
     let year = dayMonthMatch[3] ? parseInt(dayMonthMatch[3], 10) : defaultYear;
     if (year < 100) year += 2000;
-    if (months[mStr] !== undefined) {
-      return new Date(Date.UTC(year, months[mStr], day)).getTime();
-    }
+    if (months[mStr] !== undefined) return new Date(Date.UTC(year, months[mStr], day)).getTime();
   }
 
-  // Pattern 2: "Sept 06 2026", "Oct 6"
   const monthDayMatch = str.match(/^([a-z]+)\s+(\d{1,2})(?:\s+(\d{2,4}))?$/i);
   if (monthDayMatch) {
     const mStr = monthDayMatch[1].toLowerCase();
     const day = parseInt(monthDayMatch[2], 10);
     let year = monthDayMatch[3] ? parseInt(monthDayMatch[3], 10) : defaultYear;
     if (year < 100) year += 2000;
-    if (months[mStr] !== undefined) {
-      return new Date(Date.UTC(year, months[mStr], day)).getTime();
-    }
+    if (months[mStr] !== undefined) return new Date(Date.UTC(year, months[mStr], day)).getTime();
   }
 
-  // Pattern 3: Slash / Dash / Dot formats like "01/10/2026", "06/09", "2026-10-01"
   const parts = str.split(/[\/\-\.]/);
   if (parts.length >= 2) {
     if (parts[0].length === 4) {
-      // YYYY-MM-DD
       const year = parseInt(parts[0], 10);
       const month = parseInt(parts[1], 10) - 1;
       const day = parseInt(parts[2], 10);
       return new Date(Date.UTC(year, month, day)).getTime();
     } else {
-      // DD/MM/YYYY or DD/MM
       const day = parseInt(parts[0], 10);
       const month = parseInt(parts[1], 10) - 1;
       let year = parts[2] ? parseInt(parts[2], 10) : defaultYear;
       if (year < 100) year += 2000;
-      if (!isNaN(day) && !isNaN(month)) {
-        return new Date(Date.UTC(year, month, day)).getTime();
-      }
+      if (!isNaN(day) && !isNaN(month)) return new Date(Date.UTC(year, month, day)).getTime();
     }
   }
 
@@ -201,7 +185,6 @@ function parseStartTimeToMinutes(timeStr) {
   } else if (hours > 23) {
     return null;
   }
-
   return hours * 60 + minutes;
 }
 
@@ -209,7 +192,6 @@ function createCalendarStartDate(dateStr, timeStr) {
   const dateValue = parseDateStrToVal(dateStr);
   const startMinutes = parseStartTimeToMinutes(timeStr);
   if (!dateValue || startMinutes === null) return null;
-
   const istOffsetMinutes = 5 * 60 + 30;
   return new Date(dateValue + (startMinutes - istOffsetMinutes) * 60 * 1000);
 }
@@ -241,26 +223,18 @@ async function writeScheduleRow(sheets, sheetDetails, targetRowIndex, rowValues)
 }
 
 function findInsertionRowIndex(existingRows, newDateVal, newTimeVal) {
-  if (!newDateVal) return existingRows.length + 1; // Append at end if date unparseable
-
+  if (!newDateVal) return existingRows.length + 1;
   for (let i = 1; i < existingRows.length; i++) {
     const row = existingRows[i];
     const rDateStr = String(row[0] || '').trim();
     if (!rDateStr) continue;
-
     const rDateVal = parseDateStrToVal(rDateStr);
     if (!rDateVal) continue;
-
     const rTimeVal = parseStartTimeToMinutes(String(row[1] || ''));
-
-    if (rDateVal > newDateVal) {
-      return i + 1; // 1-based row index for Google Sheets
-    } else if (rDateVal === newDateVal && rTimeVal > newTimeVal) {
-      return i + 1;
-    }
+    if (rDateVal > newDateVal) return i + 1;
+    else if (rDateVal === newDateVal && rTimeVal > newTimeVal) return i + 1;
   }
-
-  return existingRows.length + 1; // Append at end if after all existing dates
+  return existingRows.length + 1;
 }
 
 function createScheduleRowValues({ date, time, center, course, subject, faculty }, calendarEventId = '') {
@@ -270,36 +244,22 @@ function createScheduleRowValues({ date, time, center, course, subject, faculty 
 function parseCreateArgs(argsStr) {
   if (!argsStr) return null;
 
-  // 1. Pipe separated
   if (argsStr.includes('|')) {
     const parts = argsStr.split('|').map(s => s.trim());
     if (parts.length >= 6) {
-      return {
-        date: parts[0],
-        time: parts[1],
-        center: parts[2],
-        course: parts[3],
-        subject: parts[4],
-        faculty: parts[5]
-      };
+      return { date: parts[0], time: parts[1], center: parts[2], course: parts[3], subject: parts[4], faculty: parts[5] };
     }
   }
 
-  // 2. Multi-line (newlines)
   if (argsStr.includes('\n')) {
     const lines = argsStr.split('\n').map(s => s.trim()).filter(Boolean);
-
-    // Check Key-Value syntax (e.g. "Date: 06 Sept 2026")
     const kv = {};
     lines.forEach(line => {
       const idx = line.indexOf(':');
       if (idx !== -1) {
-        const key = line.substring(0, idx).trim().toLowerCase();
-        const val = line.substring(idx + 1).trim();
-        kv[key] = val;
+        kv[line.substring(0, idx).trim().toLowerCase()] = line.substring(idx + 1).trim();
       }
     });
-
     if (kv.date || kv.time || kv.center || kv.course || kv.subject || kv.faculty) {
       return {
         date: kv.date || kv.dt || '',
@@ -310,45 +270,26 @@ function parseCreateArgs(argsStr) {
         faculty: kv.faculty || kv.teacher || kv.sir || kv.maam || ''
       };
     }
-
     if (lines.length >= 6) {
-      return {
-        date: lines[0],
-        time: lines[1],
-        center: lines[2],
-        course: lines[3],
-        subject: lines[4],
-        faculty: lines[5]
-      };
+      return { date: lines[0], time: lines[1], center: lines[2], course: lines[3], subject: lines[4], faculty: lines[5] };
     }
   }
 
-  // 3. Comma separated
   if (argsStr.includes(',')) {
     const parts = argsStr.split(',').map(s => s.trim());
     if (parts.length >= 6) {
-      return {
-        date: parts[0],
-        time: parts[1],
-        center: parts[2],
-        course: parts[3],
-        subject: parts[4],
-        faculty: parts[5]
-      };
+      return { date: parts[0], time: parts[1], center: parts[2], course: parts[3], subject: parts[4], faculty: parts[5] };
     }
   }
-
   return null;
 }
 
 function getSheetsClient() {
-  const auth = getGoogleAuth();
-  return google.sheets({ version: 'v4', auth });
+  return google.sheets({ version: 'v4', auth: getGoogleAuth() });
 }
 
 function getCalendarClient() {
-  const auth = getGoogleAuth();
-  return google.calendar({ version: 'v3', auth });
+  return google.calendar({ version: 'v3', auth: getGoogleAuth() });
 }
 
 function isGoogleNotFoundError(error) {
@@ -357,7 +298,6 @@ function isGoogleNotFoundError(error) {
 
 async function deleteCalendarEvent(calendar, calendarId, storedEventId) {
   if (!storedEventId) return 'not-linked';
-
   try {
     await calendar.events.get({ calendarId, eventId: storedEventId });
     await calendar.events.delete({ calendarId, eventId: storedEventId });
@@ -365,21 +305,13 @@ async function deleteCalendarEvent(calendar, calendarId, storedEventId) {
   } catch (error) {
     if (!isGoogleNotFoundError(error)) throw error;
   }
-
-  const matchingEvents = await calendar.events.list({
-    calendarId,
-    iCalUID: storedEventId,
-    maxResults: 2
-  });
+  const matchingEvents = await calendar.events.list({ calendarId, iCalUID: storedEventId, maxResults: 2 });
   const events = matchingEvents.data.items || [];
-
   if (events.length > 1) {
     throw new Error('More than one Calendar event matches the identifier in column H. No event or row was deleted.');
   }
-
   const eventId = events.length === 1 ? events[0].id : null;
   if (!eventId) return 'not-found';
-
   try {
     await calendar.events.delete({ calendarId, eventId });
     return 'deleted';
@@ -416,12 +348,7 @@ async function deleteScheduleRow(sheets, calendar, sheetDetails, rowNum, calenda
       requestBody: {
         requests: [{
           deleteDimension: {
-            range: {
-              sheetId: sheetDetails.sheetId,
-              dimension: 'ROWS',
-              startIndex: rowNum - 1,
-              endIndex: rowNum
-            }
+            range: { sheetId: sheetDetails.sheetId, dimension: 'ROWS', startIndex: rowNum - 1, endIndex: rowNum }
           }
         }]
       }
@@ -432,81 +359,54 @@ async function deleteScheduleRow(sheets, calendar, sheetDetails, rowNum, calenda
       : `Schedule row ${rowNum} could not be removed. Check Google Sheets access and retry.`;
     throw error;
   }
-
   return calendarDeleteResult;
 }
 
-// Function to automatically sync class to Google Calendar
 async function createCalendarEvent({ dateStr, timeStr, center, course, subject, faculty }) {
   const calendarId = process.env.GOOGLE_CALENDAR_ID || 'primary';
   const calendar = getCalendarClient();
   const startDate = createCalendarStartDate(dateStr, timeStr);
   if (!startDate) return null;
-
-  // Default duration 2 hours
   const endDate = new Date(startDate.getTime() + 2 * 60 * 60 * 1000);
-
   const summary = `${course} - ${subject} (${faculty}) @ ${center}`;
   const description = `Class Schedule: ${course} - ${subject}\nFaculty: ${faculty}\nCenter: ${center}\nTime: ${timeStr}`;
 
   const res = await calendar.events.insert({
-    calendarId: calendarId,
+    calendarId,
     requestBody: {
-      summary: summary,
-      location: center,
-      description: description,
-      start: {
-        dateTime: startDate.toISOString(),
-      },
-      end: {
-        dateTime: endDate.toISOString(),
-      },
-    },
+      summary, location: center, description,
+      start: { dateTime: startDate.toISOString() },
+      end:   { dateTime: endDate.toISOString() }
+    }
   });
-
   return res.data;
 }
 
-// Dynamically resolve target sheet tab name and sheet ID
 async function resolveSheetDetails(sheets) {
   const spreadsheet = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
   const sheetList = spreadsheet.data.sheets || [];
-
-  // Match 'Schedule' or fall back to the first sheet tab.
   const matchedSheet = sheetList.find(s => s.properties.title.trim().toLowerCase() === DEFAULT_SHEET_TAB.toLowerCase()) || sheetList[0];
   if (!matchedSheet || !matchedSheet.properties || !Number.isInteger(matchedSheet.properties.sheetId)) {
     throw new Error('The spreadsheet does not contain a usable sheet tab.');
   }
-
-  return {
-    title: matchedSheet.properties.title,
-    sheetId: matchedSheet.properties.sheetId
-  };
+  return { title: matchedSheet.properties.title, sheetId: matchedSheet.properties.sheetId };
 }
 
 function setTelegramCommandMenu() {
   const data = JSON.stringify({ commands: TELEGRAM_COMMANDS });
-
   return new Promise((resolve, reject) => {
     const options = {
-      hostname: 'api.telegram.org',
-      port: 443,
+      hostname: 'api.telegram.org', port: 443,
       path: `/bot${TELEGRAM_BOT_TOKEN}/setMyCommands`,
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(data)
-      }
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
     };
-
     const req = https.request(options, response => {
       let body = '';
       response.on('data', chunk => body += chunk);
       response.on('end', () => {
         let result;
-        try {
-          result = JSON.parse(body);
-        } catch {
+        try { result = JSON.parse(body); } catch {
           reject(new Error('Telegram returned an invalid response while setting the command menu.'));
           return;
         }
@@ -517,7 +417,6 @@ function setTelegramCommandMenu() {
         resolve(result.result);
       });
     });
-
     req.on('error', reject);
     req.setTimeout(10000, () => req.destroy(new Error('Telegram command menu setup timed out.')));
     req.write(data);
@@ -530,58 +429,6 @@ function getSafeErrorDetails(error) {
   const message = String(error.message || 'Unknown error').replace(/[\r\n`]/g, ' ').slice(0, 240);
   const safeMessage = message.replace(/([_*[\]()])/g, '\\$1');
   return status ? `${safeMessage} (code ${status})` : safeMessage;
-}
-
-async function requestWhatsAppReauth(fetchImpl = fetch, env = process.env) {
-  const endpoint = env.RENDER_REAUTH_URL;
-  const token = env.RENDER_REAUTH_TOKEN;
-  if (!endpoint || !token) {
-    const error = new Error('WhatsApp re-authentication is not configured. Add the Render endpoint URL and shared re-auth token to Vercel.');
-    error.userMessage = error.message;
-    throw error;
-  }
-
-  let endpointUrl;
-  try {
-    endpointUrl = new URL(endpoint);
-  } catch {
-    const error = new Error('The Render re-auth endpoint must be a valid HTTPS URL ending in /reauth.');
-    error.userMessage = error.message;
-    throw error;
-  }
-  if (endpointUrl.protocol !== 'https:' || !endpointUrl.pathname.replace(/\/+$/, '').endsWith('/reauth')) {
-    const error = new Error('The Render re-auth endpoint must be a valid HTTPS URL ending in /reauth.');
-    error.userMessage = error.message;
-    throw error;
-  }
-
-  const response = await fetchImpl(endpointUrl, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: 'application/json'
-    },
-    signal: AbortSignal.timeout(10000)
-  });
-  const responseText = await response.text();
-  let responseBody = {};
-  if (responseText) {
-    try {
-      responseBody = JSON.parse(responseText);
-    } catch {
-      responseBody = {};
-    }
-  }
-
-  if (!response.ok || responseBody.success !== true) {
-    const error = new Error(`Render re-authentication request failed (HTTP ${response.status}).`);
-    error.code = response.status;
-    error.userMessage = response.status === 401
-      ? 'Render rejected the re-authentication request. Verify the shared re-auth token matches in Vercel and Render.'
-      : responseBody.message || error.message;
-    throw error;
-  }
-  return responseBody;
 }
 
 function isAuthorized(chatId, userId) {
@@ -614,7 +461,9 @@ async function handlePreviewCallback(callbackQuery) {
   }
 
   const rows = await fetchPendingRows();
-  const group = groupPendingRows(rows).find(candidate => candidate.rowIndices.includes(Number(match[2])));
+  const group = groupPendingRows(rows).find(candidate =>
+    candidate.rowIndices.includes(Number(match[2]))
+  );
   if (!group || callbackSignature(group) !== match[3]) {
     await answerCallbackQuery(callbackQuery.id, 'This preview is out of date. Run /preview again.');
     return;
@@ -653,18 +502,9 @@ async function handlePreviewCallback(callbackQuery) {
 module.exports = async (req, res) => {
   const pathname = new URL(req.url || '/', 'https://vercel.invalid').pathname;
   if (pathname === '/api/cron') {
-    if (req.method !== 'GET') {
-      res.status(405).json({ ok: false, error: 'Method not allowed.' });
-      return;
-    }
-    if (!process.env.CRON_SECRET) {
-      res.status(500).json({ ok: false, error: 'CRON_SECRET is not configured.' });
-      return;
-    }
-    if (!isValidCronAuthorization(req.headers?.authorization)) {
-      res.status(401).json({ ok: false, error: 'Invalid cron authorization.' });
-      return;
-    }
+    if (req.method !== 'GET') { res.status(405).json({ ok: false, error: 'Method not allowed.' }); return; }
+    if (!process.env.CRON_SECRET) { res.status(500).json({ ok: false, error: 'CRON_SECRET is not configured.' }); return; }
+    if (!isValidCronAuthorization(req.headers?.authorization)) { res.status(401).json({ ok: false, error: 'Invalid cron authorization.' }); return; }
     try {
       const groupsSent = await runPreview(AUTHORIZED_CHAT_ID);
       res.status(200).json({ ok: true, groupsSent });
@@ -675,18 +515,11 @@ module.exports = async (req, res) => {
     return;
   }
 
-  if (req.method !== 'POST') {
-    res.status(200).send('TCR Telegram Bot Webhook API is running.');
-    return;
-  }
+  if (req.method !== 'POST') { res.status(200).send('TCR Telegram Bot Webhook API is running.'); return; }
 
   const missingConfiguration = getMissingConfiguration();
   if (missingConfiguration.length > 0) {
-    res.status(500).json({
-      ok: false,
-      error: 'Bot configuration is incomplete.',
-      missingEnvironmentVariables: missingConfiguration
-    });
+    res.status(500).json({ ok: false, error: 'Bot configuration is incomplete.', missingEnvironmentVariables: missingConfiguration });
     return;
   }
 
@@ -721,13 +554,11 @@ module.exports = async (req, res) => {
       const chatId = message.chat.id;
       const userId = message.from ? message.from.id : null;
 
-      // Access Authorization Check
       if (!isAuthorized(chatId, userId)) {
         await sendTelegramMessage(chatId, `🚫 *Access Denied.* Your Chat ID (\`${chatId}\`) is not authorized to interact with this bot.`);
         res.status(200).json({ ok: true });
         return;
       }
-
       await handleTelegramCommand(chatId, text);
     }
 
@@ -738,7 +569,6 @@ module.exports = async (req, res) => {
   }
 };
 
-// Slash Command Routing Logic
 async function handleTelegramCommand(chatId, text) {
   const parts = text.split(/\s+/);
   const command = parts[0].toLowerCase();
@@ -747,35 +577,24 @@ async function handleTelegramCommand(chatId, text) {
   if (command === '/start' || command === '/help') {
     const helpMsg =
       `🤖 *TCR Class Scheduler Bot*\n\n` +
-      `Here are the available commands:\n\n` +
-      `📌 */list* _[date or filter]_\n` +
-      `View schedule. Examples:\n` +
-      `• \`/list\` - List all upcoming classes\n` +
-      `• \`/list 4 Oct 2026\` - List classes for date\n` +
-      `• \`/list Laxmi Nagar\` - List classes by center\n\n` +
-      `📌 */create* _Class Details_\n` +
-      `Add a new class row chronologically. Flexible formats supported:\n\n` +
-      `• *Comma / Pipe / Newline:* \n` +
-      `  \`/create 06 Sept 2026, 4:00 - 6:00PM, Laxmi Nagar, CLAT, Legal, Shivam Sir\`\n\n` +
-      `• *Key-Value:* \n` +
-      `  \`/create\`\n` +
-      `  \`Date: 06 Sept 2026\`\n` +
-      `  \`Time: 4:00 - 6:00PM\`\n` +
-      `  \`Center: Laxmi Nagar\`\n` +
-      `  \`Course: CLAT\`\n` +
-      `  \`Subject: Legal\`\n` +
-      `  \`Faculty: Shivam Sir\`\n\n` +
-      `📌 */update* _RowNumber Field NewValue_\n` +
-      `Update row. Example: \`/update 15 Time 5:00 - 7:00PM\`\n\n` +
-      `📌 */delete* _RowNumber_\n` +
-      `Delete row. Example: \`/delete 15\`\n\n` +
-      `📌 */check*\n` +
-      `Check bot online status and pending dispatches.\n\n` +
-      `📌 */preview*\n` +
-      `Preview upcoming classes, prepare Zoom links, and open a WhatsApp-ready message.\n\n` +
-      `📌 */reauth*\n` +
-      `Manually trigger WhatsApp re-authentication. Use this if you logged out WhatsApp or need to reconnect.\n\n` +
-      `🗑️ When you use */delete*, the bot also deletes the linked Calendar event stored in column H. Deleting a row directly in Sheets does not trigger this cleanup.`;
+      `*Broadcast*\n` +
+      `📌 */preview* — Prepare tomorrow's WhatsApp messages\n` +
+      `📌 */status* — System status and pending counts\n\n` +
+      `*Schedule*\n` +
+      `📌 */today* — List today's classes\n` +
+      `📌 */tomorrow* — List tomorrow's classes\n` +
+      `📌 */pending* — All unsent classes (any date)\n` +
+      `📌 */list* _[filter]_ — Search schedule\n` +
+      `   e.g. \`/list 4 Oct\`, \`/list Laxmi Nagar\`, \`/list CLAT\`\n` +
+      `📌 */faculty* _Name_ — Classes by faculty\n` +
+      `   e.g. \`/faculty Shivam\`\n\n` +
+      `*Edit*\n` +
+      `📌 */create* _Details_ — Add a class (comma/pipe/newline format)\n` +
+      `📌 */update* _Row Field Value_ — Update one field\n` +
+      `   e.g. \`/update 15 Faculty Anand Sir\`\n` +
+      `📌 */resend* _Row_ — Reset a row for resending\n` +
+      `📌 */undo* _Row_ — Unmark SENT (keep Zoom link)\n` +
+      `📌 */delete* _Row_ — Delete row + linked Calendar event`;
 
     try {
       await setTelegramCommandMenu();
@@ -789,142 +608,188 @@ async function handleTelegramCommand(chatId, text) {
   }
 
   try {
-    if (command === '/check') {
-      const sheets = getSheetsClient();
-      const sheetDetails = await resolveSheetDetails(sheets);
-      const response = await sheets.spreadsheets.values.get({
-        spreadsheetId: SPREADSHEET_ID,
-        range: `'${sheetDetails.title}'!A1:G`
-      });
-
-      const rows = response.data.values || [];
-      let pendingCount = 0;
-
-      for (let i = 1; i < rows.length; i++) {
-        if (rows[i][0] && String(rows[i][6] || '').trim() !== 'SENT') {
-          pendingCount++;
-        }
-      }
-
-      const msg = `📊 *TCR Class Scheduler Bot*\n\n*System is online.* There are *${pendingCount}* pending classes in tab \`${sheetDetails.title}\` waiting for dispatch.`;
-      await sendTelegramMessage(chatId, msg);
-      return;
-    }
-
-    if (command === '/list') {
-      await handleListCommand(chatId, argsStr);
-      return;
-    }
-
-    if (command === '/create' || command === '/add') {
-      await handleCreateCommand(chatId, argsStr);
-      return;
-    }
-
-    if (command === '/update') {
-      await handleUpdateCommand(chatId, argsStr);
-      return;
-    }
-
-    if (command === '/delete') {
-      await handleDeleteCommand(chatId, argsStr);
-      return;
-    }
-
-    if (command === '/preview') {
-      await runPreview(chatId);
-      return;
-    }
-
-    if (command === '/reauth') {
-      await handleReauthCommand(chatId);
-      return;
-    }
+    if (command === '/status')   { await handleStatusCommand(chatId); return; }
+    if (command === '/preview')  { await runPreview(chatId); return; }
+    if (command === '/today')    { await handleDateCommand(chatId, 0); return; }
+    if (command === '/tomorrow') { await handleDateCommand(chatId, 1); return; }
+    if (command === '/pending')  { await handlePendingCommand(chatId); return; }
+    if (command === '/list')     { await handleListCommand(chatId, argsStr); return; }
+    if (command === '/faculty')  { await handleFacultyCommand(chatId, argsStr); return; }
+    if (command === '/create' || command === '/add') { await handleCreateCommand(chatId, argsStr); return; }
+    if (command === '/update')   { await handleUpdateCommand(chatId, argsStr); return; }
+    if (command === '/resend')   { await handleResendCommand(chatId, argsStr); return; }
+    if (command === '/undo')     { await handleUndoCommand(chatId, argsStr); return; }
+    if (command === '/delete')   { await handleDeleteCommand(chatId, argsStr); return; }
 
     await sendTelegramMessage(chatId, `⚠️ Unknown command. Type /help to see all available commands.`);
   } catch (err) {
     const referenceId = crypto.randomUUID();
-    console.error('Command Execution Error:', {
-      referenceId,
-      command,
-      message: err.message,
-      code: err.code || err.response?.status
-    });
+    console.error('Command Execution Error:', { referenceId, command, message: err.message, code: err.code || err.response?.status });
     const report = err.userMessage || `The command failed: ${getSafeErrorDetails(err)}.`;
     await sendTelegramMessage(chatId, `⚠️ ${report}\nReference: \`${referenceId}\``);
   }
 }
 
-async function handleListCommand(chatId, filterText) {
-  const sheets = getSheetsClient();
-  const sheetDetails = await resolveSheetDetails(sheets);
-  const response = await sheets.spreadsheets.values.get({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `'${sheetDetails.title}'!A1:G`
+// ---------- New command handlers ----------
+
+async function handleStatusCommand(chatId) {
+  const rows = await fetchAllRows();
+  const todayKey = indiaDateKey(0);
+  const tomorrowKey = indiaDateKey(1);
+
+  const pending = rows.filter(r => r.status !== 'SENT');
+  const todayRows = rows.filter(r => scheduleDateKey(r.date) === todayKey);
+  const tomorrowRows = rows.filter(r => scheduleDateKey(r.date) === tomorrowKey);
+  const prepared = pending.filter(r => r.zoomUrl);
+
+  const now = new Date().toLocaleString('en-IN', {
+    timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short'
   });
 
-  const rows = response.data.values || [];
-  if (rows.length <= 1) {
-    await sendTelegramMessage(chatId, `📅 No classes found in the schedule.`);
+  const msg =
+    `🤖 *TCR Bot Status*\n\n` +
+    `🕐 IST now: *${now}*\n` +
+    `📊 Total rows: *${rows.length}*\n` +
+    `⏳ Pending (G ≠ SENT): *${pending.length}*\n` +
+    `🎥 Of those, Zoom prepared: *${prepared.length}*\n\n` +
+    `📅 Today (${formatScheduleDate(todayKey)}): *${todayRows.length}* class(es)\n` +
+    `📅 Tomorrow (${formatScheduleDate(tomorrowKey)}): *${tomorrowRows.length}* class(es)\n\n` +
+    `💡 Run /preview to prepare WhatsApp messages.`;
+
+  await sendTelegramMessage(chatId, msg);
+}
+
+async function handleDateCommand(chatId, offsetDays) {
+  const rows = await fetchAllRows();
+  const target = indiaDateKey(offsetDays);
+  const filtered = rows.filter(r => scheduleDateKey(r.date) === target);
+  const label = offsetDays === 0 ? 'Today' : 'Tomorrow';
+  await sendRowList(chatId, `${label} · ${formatScheduleDate(target)}`, filtered);
+}
+
+async function handlePendingCommand(chatId) {
+  const rows = await fetchAllRows();
+  const pending = rows.filter(r => r.status !== 'SENT');
+  await sendRowList(chatId, 'Pending classes (G ≠ SENT)', pending);
+}
+
+async function handleFacultyCommand(chatId, nameFilter) {
+  if (!nameFilter) {
+    await sendTelegramMessage(chatId, `⚠️ *Usage:* \`/faculty Shivam\`\nShows all classes taught by the matching faculty name.`);
+    return;
+  }
+  const rows = await fetchAllRows();
+  const norm = nameFilter.trim().toLowerCase();
+  const filtered = rows.filter(r => r.faculty.toLowerCase().includes(norm));
+  await sendRowList(chatId, `Classes for "${nameFilter}"`, filtered);
+}
+
+async function sendRowList(chatId, title, rows) {
+  if (!rows.length) {
+    await sendTelegramMessage(chatId, `📭 *${title}*\nNo matching classes.`);
     return;
   }
 
-  const matchingRows = [];
-
-  for (let i = 1; i < rows.length; i++) {
-    const row = rows[i];
-    const dateStr = String(row[0] || '').trim();
-    if (!dateStr) continue;
-
-    const timeStr = String(row[1] || '').trim();
-    const centerStr = String(row[2] || '').trim();
-    const courseStr = String(row[3] || '').trim();
-    const subjectStr = String(row[4] || '').trim();
-    const facultyStr = String(row[5] || '').trim();
-    const statusStr = String(row[6] || '').trim();
-
-    const fullRowText = `${dateStr} ${timeStr} ${centerStr} ${courseStr} ${subjectStr} ${facultyStr} ${statusStr}`;
-
-    if (!filterText || matchesFilter(dateStr, fullRowText, filterText)) {
-      matchingRows.push({
-        rowNum: i + 1,
-        date: dateStr,
-        time: timeStr,
-        center: centerStr,
-        course: courseStr,
-        subject: subjectStr,
-        faculty: facultyStr,
-        status: statusStr
-      });
-    }
-  }
-
-  if (matchingRows.length === 0) {
-    await sendTelegramMessage(chatId, `📅 No classes found matching filter: \`${filterText}\``);
-    return;
-  }
-
-  let message = filterText ? `📅 *Classes matching "${filterText}"* (${matchingRows.length}):\n\n` : `📅 *Master Class Schedule* (${matchingRows.length} classes):\n\n`;
-
-  matchingRows.forEach((item, index) => {
+  let message = `📅 *${title}* (${rows.length}):\n\n`;
+  rows.forEach((item, index) => {
     const statusBadge = item.status === 'SENT' ? ' ✅ `SENT`' : '';
-    message += `📍 *Row ${item.rowNum}* ${statusBadge}\n` +
+    const zoomBadge = item.zoomUrl ? ' 🎥' : '';
+    const facultyLine = item.faculty ? `👨‍🏫 *Faculty:* ${item.faculty}\n` : '';
+    message += `📍 *Row ${item.rowIndex}* ${statusBadge}${zoomBadge}\n` +
                `🗓 *Date:* ${item.date}\n` +
                `⏰ *Time:* ${item.time}\n` +
                `🏛 *Center:* ${item.center}\n` +
                `📚 *Course:* ${item.course} | *Subject:* ${item.subject}\n` +
-               `👨‍🏫 *Faculty:* ${item.faculty}\n`;
-
-    if (index < matchingRows.length - 1) {
-      message += `───────────────\n`;
-    }
+               facultyLine;
+    if (index < rows.length - 1) message += `───────────────\n`;
   });
 
   if (message.length > 4000) {
-    message = message.substring(0, 3900) + `\n\n⚠️ _Output truncated due to length limits. Refine your query with /list <date> or /list <center>._`;
+    message = message.substring(0, 3900) + `\n\n⚠️ _Output truncated. Refine with a filter._`;
+  }
+  await sendTelegramMessage(chatId, message);
+}
+
+async function handleResendCommand(chatId, argsStr) {
+  const rowNum = parseInt(argsStr.trim(), 10);
+  if (!Number.isInteger(rowNum) || rowNum < 2) {
+    await sendTelegramMessage(chatId, `⚠️ *Usage:* \`/resend 15\`\nClears G (status) and I (Zoom) so the row can be re-prepared.`);
+    return;
   }
 
-  await sendTelegramMessage(chatId, message);
+  const sheets = getSheetsClient();
+  const sheetDetails = await resolveSheetDetails(sheets);
+
+  const check = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `'${sheetDetails.title}'!A${rowNum}:I${rowNum}`
+  });
+  const row = check.data.values?.[0] || [];
+  if (!row.some(v => String(v || '').trim())) {
+    await sendTelegramMessage(chatId, `❌ Row ${rowNum} is empty.`);
+    return;
+  }
+
+  await sheets.spreadsheets.values.batchUpdate({
+    spreadsheetId: SPREADSHEET_ID,
+    requestBody: {
+      valueInputOption: 'RAW',
+      data: [
+        { range: `'${sheetDetails.title}'!G${rowNum}`, values: [['']] },
+        { range: `'${sheetDetails.title}'!I${rowNum}`, values: [['']] }
+      ]
+    }
+  });
+  await sendTelegramMessage(chatId, `♻️ *Row ${rowNum} reset.*\nStatus (G) and Zoom link (I) cleared. Run /preview to re-prepare it.`);
+}
+
+async function handleUndoCommand(chatId, argsStr) {
+  const rowNum = parseInt(argsStr.trim(), 10);
+  if (!Number.isInteger(rowNum) || rowNum < 2) {
+    await sendTelegramMessage(chatId, `⚠️ *Usage:* \`/undo 15\`\nUnmarks SENT but keeps the Zoom link in column I.`);
+    return;
+  }
+
+  const sheets = getSheetsClient();
+  const sheetDetails = await resolveSheetDetails(sheets);
+
+  const check = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `'${sheetDetails.title}'!G${rowNum}`
+  });
+  const currentStatus = String(check.data.values?.[0]?.[0] || '').trim().toUpperCase();
+  if (currentStatus !== 'SENT') {
+    await sendTelegramMessage(chatId, `ℹ️ Row ${rowNum} is not marked SENT (currently: ${currentStatus || 'empty'}). Nothing to undo.`);
+    return;
+  }
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `'${sheetDetails.title}'!G${rowNum}`,
+    valueInputOption: 'RAW',
+    requestBody: { values: [['']] }
+  });
+  await sendTelegramMessage(chatId, `↩️ *Row ${rowNum} unmarked.*\nStatus (G) cleared. Zoom link (I) preserved.`);
+}
+
+// ---------- Existing command handlers ----------
+
+async function handleListCommand(chatId, filterText) {
+  const rows = await fetchAllRows();
+
+  if (!rows.length) {
+    await sendTelegramMessage(chatId, `📅 No classes found in the schedule.`);
+    return;
+  }
+
+  const matchingRows = rows.filter(r => {
+    if (!filterText) return true;
+    const fullRowText = `${r.date} ${r.time} ${r.center} ${r.course} ${r.subject} ${r.faculty} ${r.status}`;
+    return matchesFilter(r.date, fullRowText, filterText);
+  });
+
+  const title = filterText ? `Classes matching "${filterText}"` : 'Master Class Schedule';
+  await sendRowList(chatId, title, matchingRows);
 }
 
 async function handleCreateCommand(chatId, argsStr) {
@@ -932,20 +797,17 @@ async function handleCreateCommand(chatId, argsStr) {
 
   if (!hasCompleteScheduleDetails(parsed || {})) {
     const usageMsg =
-      `⚠️ *How to create a class:* You can use commas, newlines, or key-value format!\n\n` +
-      `*1. Natural / Comma Separated:* (easiest on mobile)\n` +
+      `⚠️ *How to create a class:*\n\n` +
+      `*Comma separated:*\n` +
       `\`/create 06 Sept 2026, 4:00 - 6:00PM, Laxmi Nagar, CLAT, Legal, Shivam Sir\`\n\n` +
-      `*2. Key-Value format:*\n` +
+      `*Key-Value:*\n` +
       `\`/create\`\n` +
       `\`Date: 06 Sept 2026\`\n` +
       `\`Time: 4:00 - 6:00PM\`\n` +
       `\`Center: Laxmi Nagar\`\n` +
       `\`Course: CLAT\`\n` +
       `\`Subject: Legal\`\n` +
-      `\`Faculty: Shivam Sir\`\n\n` +
-      `*3. Pipe Separated:*\n` +
-      `\`/create 06 Sept 2026 | 4:00 - 6:00PM | Laxmi Nagar | CLAT | Legal | Shivam Sir\``;
-
+      `\`Faculty: Shivam Sir\``;
     await sendTelegramMessage(chatId, usageMsg);
     return;
   }
@@ -957,20 +819,14 @@ async function handleCreateCommand(chatId, argsStr) {
     return;
   }
 
-  // 1. Sync to Google Calendar
   let calendarEventId = '';
   let calSyncText = '⏳ Pending';
   let calendarSyncFailure = '';
   try {
     const calResult = await createCalendarEvent({
-      dateStr: dateVal,
-      timeStr: timeVal,
-      center: centerVal,
-      course: courseVal,
-      subject: subjectVal,
-      faculty: facultyVal
+      dateStr: dateVal, timeStr: timeVal, center: centerVal,
+      course: courseVal, subject: subjectVal, faculty: facultyVal
     });
-
     if (calResult) {
       calendarEventId = calResult.iCalUID || '';
       calSyncText = '✅ Synced to Google Calendar';
@@ -985,26 +841,17 @@ async function handleCreateCommand(chatId, argsStr) {
   const sheets = getSheetsClient();
   const sheetDetails = await resolveSheetDetails(sheets);
 
-  // Read existing schedule rows to determine chronological insertion position
   const readRes = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
     range: `'${sheetDetails.title}'!A1:H`
   });
 
   const existingRows = readRes.data.values || [];
-  const newDateVal = parseDateStrToVal(dateVal);
-  const newTimeVal = parseStartTimeToMinutes(timeVal);
-
-  const targetRowIndex = findInsertionRowIndex(existingRows, newDateVal, newTimeVal);
-  await writeScheduleRow(
-    sheets,
-    sheetDetails,
-    targetRowIndex,
-    createScheduleRowValues(parsed, calendarEventId)
-  );
+  const targetRowIndex = findInsertionRowIndex(existingRows, parseDateStrToVal(dateVal), parseStartTimeToMinutes(timeVal));
+  await writeScheduleRow(sheets, sheetDetails, targetRowIndex, createScheduleRowValues(parsed, calendarEventId));
 
   const confirmMsg =
-    `✅ *Class Created Successfully! (Sorted Chronologically)*\n\n` +
+    `✅ *Class Created!*\n\n` +
     `📍 *Row:* ${targetRowIndex}\n` +
     `🗓 *Date:* ${dateVal}\n` +
     `⏰ *Time:* ${timeVal}\n` +
@@ -1012,35 +859,26 @@ async function handleCreateCommand(chatId, argsStr) {
     `📚 *Course:* ${courseVal} - ${subjectVal}\n` +
     `👨‍🏫 *Faculty:* ${facultyVal}\n` +
     `📅 *Calendar:* ${calSyncText}${calendarSyncFailure}`;
-
   await sendTelegramMessage(chatId, confirmMsg);
 }
 
 async function handleUpdateCommand(chatId, argsStr) {
   if (!argsStr) {
-    await sendTelegramMessage(chatId, `⚠️ *Usage:* \`/update RowNumber Field NewValue\` OR \`/update RowNumber Date, Time, Center, Course, Subject, Faculty\`\n\n*Examples:*\n• \`/update 15 Time 5:00 - 7:00PM\`\n• \`/update 15 Faculty Anand Sir\``);
+    await sendTelegramMessage(chatId, `⚠️ *Usage:* \`/update Row Field Value\`\n\n*Examples:*\n• \`/update 15 Time 5:00 - 7:00PM\`\n• \`/update 15 Faculty Anand Sir\``);
     return;
   }
 
   const spaceIndex = argsStr.indexOf(' ');
-  if (spaceIndex === -1) {
-    await sendTelegramMessage(chatId, `⚠️ Invalid syntax. Must specify row number followed by field and new value or row parameters.`);
-    return;
-  }
+  if (spaceIndex === -1) { await sendTelegramMessage(chatId, `⚠️ Invalid syntax.`); return; }
 
-  const rowNumStr = argsStr.substring(0, spaceIndex).trim();
-  const rowNum = parseInt(rowNumStr, 10);
+  const rowNum = parseInt(argsStr.substring(0, spaceIndex).trim(), 10);
   const restStr = argsStr.substring(spaceIndex).trim();
 
   const sheets = getSheetsClient();
   const sheetDetails = await resolveSheetDetails(sheets);
 
-  if (isNaN(rowNum) || rowNum <= 1) {
-    await sendTelegramMessage(chatId, `❌ Invalid Row Number \`${rowNumStr}\`. Must be row index 2 or higher.`);
-    return;
-  }
+  if (isNaN(rowNum) || rowNum <= 1) { await sendTelegramMessage(chatId, `❌ Invalid Row Number. Must be 2 or higher.`); return; }
 
-  // Check if pipe or comma separated full row update
   const parsed = parseCreateArgs(restStr);
   if (parsed && hasCompleteScheduleDetails(parsed)) {
     await sheets.spreadsheets.values.batchUpdate({
@@ -1048,75 +886,40 @@ async function handleUpdateCommand(chatId, argsStr) {
       requestBody: {
         valueInputOption: 'USER_ENTERED',
         data: [
-          {
-            range: `'${sheetDetails.title}'!A${rowNum}:G${rowNum}`,
-            values: [[parsed.date, parsed.time, parsed.center, parsed.course, parsed.subject, parsed.faculty, '']]
-          },
-          {
-            range: `'${sheetDetails.title}'!I${rowNum}`,
-            values: [['']]
-          }
+          { range: `'${sheetDetails.title}'!A${rowNum}:G${rowNum}`,
+            values: [[parsed.date, parsed.time, parsed.center, parsed.course, parsed.subject, parsed.faculty, '']] },
+          { range: `'${sheetDetails.title}'!I${rowNum}`, values: [['']] }
         ]
       }
     });
     await sendTelegramMessage(chatId, `✅ *Row ${rowNum} updated completely!*`);
     return;
   }
-  if (parsed) {
-    await sendTelegramMessage(chatId, `⚠️ A full-row update must include Date, Time, Center, Course, Subject, and Faculty.`);
-    return;
-  }
 
-  // Single field update
   const fieldSpaceIndex = restStr.indexOf(' ');
-  if (fieldSpaceIndex === -1) {
-    await sendTelegramMessage(chatId, `⚠️ Please specify the field to update and its new value.`);
-    return;
-  }
+  if (fieldSpaceIndex === -1) { await sendTelegramMessage(chatId, `⚠️ Specify field and value.`); return; }
 
   const fieldName = restStr.substring(0, fieldSpaceIndex).trim().toLowerCase();
   const newValue = restStr.substring(fieldSpaceIndex).trim();
-
-  const fieldColMap = {
-    'date': 'A',
-    'time': 'B',
-    'center': 'C',
-    'course': 'D',
-    'subject': 'E',
-    'faculty': 'F',
-    'status': 'G'
-  };
-
+  const fieldColMap = { date: 'A', time: 'B', center: 'C', course: 'D', subject: 'E', faculty: 'F', status: 'G' };
   const colLetter = fieldColMap[fieldName];
-  if (!colLetter) {
-    await sendTelegramMessage(chatId, `❌ Unknown field \`${fieldName}\`. Valid fields are: \`Date\`, \`Time\`, \`Center\`, \`Course\`, \`Subject\`, \`Faculty\`, \`Status\`.`);
-    return;
-  }
+  if (!colLetter) { await sendTelegramMessage(chatId, `❌ Unknown field.`); return; }
 
   await sheets.spreadsheets.values.update({
     spreadsheetId: SPREADSHEET_ID,
     range: `'${sheetDetails.title}'!${colLetter}${rowNum}`,
     valueInputOption: 'USER_ENTERED',
-    requestBody: {
-      values: [[newValue]]
-    }
+    requestBody: { values: [[newValue]] }
   });
 
-  // Changes to class details invalidate both the dispatch status and stored Zoom link.
   if (fieldName !== 'status') {
     await sheets.spreadsheets.values.batchUpdate({
       spreadsheetId: SPREADSHEET_ID,
       requestBody: {
         valueInputOption: 'USER_ENTERED',
         data: [
-          {
-            range: `'${sheetDetails.title}'!G${rowNum}`,
-            values: [['']]
-          },
-          {
-            range: `'${sheetDetails.title}'!I${rowNum}`,
-            values: [['']]
-          }
+          { range: `'${sheetDetails.title}'!G${rowNum}`, values: [['']] },
+          { range: `'${sheetDetails.title}'!I${rowNum}`, values: [['']] }
         ]
       }
     });
@@ -1126,16 +929,10 @@ async function handleUpdateCommand(chatId, argsStr) {
 }
 
 async function handleDeleteCommand(chatId, argsStr) {
-  if (!argsStr) {
-    await sendTelegramMessage(chatId, `⚠️ *Usage:* \`/delete RowNumber\`\n\n*Example:* \`/delete 15\``);
-    return;
-  }
+  if (!argsStr) { await sendTelegramMessage(chatId, `⚠️ *Usage:* \`/delete 15\``); return; }
 
   const rowNum = parseInt(argsStr.trim(), 10);
-  if (isNaN(rowNum) || rowNum <= 1) {
-    await sendTelegramMessage(chatId, `❌ Invalid Row Number \`${argsStr}\`. Must be row index 2 or higher.`);
-    return;
-  }
+  if (isNaN(rowNum) || rowNum <= 1) { await sendTelegramMessage(chatId, `❌ Invalid Row Number. Must be 2 or higher.`); return; }
 
   const sheets = getSheetsClient();
   const calendar = getCalendarClient();
@@ -1148,20 +945,7 @@ async function handleDeleteCommand(chatId, argsStr) {
     'not-found': 'The linked Calendar event was already missing; the schedule row was deleted.',
     'not-linked': 'No Calendar event ID was present in column H; only the schedule row was deleted.'
   }[calendarDeleteResult];
-  await sendTelegramMessage(chatId, `🗑️ *Class Row ${rowNum} Deleted Successfully!*\n${calendarStatus}`);
-}
-
-async function handleReauthCommand(chatId) {
-  const result = await requestWhatsAppReauth();
-  if (result.alreadyConnected) {
-    await sendTelegramMessage(chatId, '✅ WhatsApp is already connected and ready to dispatch.');
-    return;
-  }
-
-  const msg = result.alreadyInProgress
-    ? '⏳ WhatsApp re-authentication is already in progress. Scan the latest QR code sent to this chat.'
-    : '🔐 WhatsApp re-authentication started. The latest QR code will be sent to this chat. Open WhatsApp → Settings → Linked Devices → Link a Device, then scan it within 2 minutes.';
-  await sendTelegramMessage(chatId, msg);
+  await sendTelegramMessage(chatId, `🗑️ *Class Row ${rowNum} Deleted!*\n${calendarStatus}`);
 }
 
 // Export internal functions for unit testing
@@ -1182,5 +966,4 @@ module.exports._deleteCalendarEvent = deleteCalendarEvent;
 module.exports._deleteScheduleRow = deleteScheduleRow;
 module.exports._setTelegramCommandMenu = setTelegramCommandMenu;
 module.exports._telegramCommands = TELEGRAM_COMMANDS;
-module.exports._requestWhatsAppReauth = requestWhatsAppReauth;
 module.exports._isValidCronAuthorization = isValidCronAuthorization;
