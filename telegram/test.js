@@ -20,7 +20,6 @@ const {
   _deleteCalendarEvent: deleteCalendarEvent,
   _deleteScheduleRow: deleteScheduleRow,
   _telegramCommands: telegramCommands,
-  _requestWhatsAppReauth: requestWhatsAppReauth,
   _isValidCronAuthorization: isValidCronAuthorization
 } = telegramWebhook;
 
@@ -37,13 +36,16 @@ assert.deepStrictEqual(Object.keys(preview).sort(), [
   'answerCallbackQuery',
   'buildKeyboard',
   'callbackSignature',
+  'fetchAllRows',
   'fetchPendingRows',
   'formatGroupMessage',
   'formatScheduleDate',
   'groupPendingRows',
+  'indiaDateKey',
   'markRowsSent',
   'prepareZoomSend',
   'runPreview',
+  'scheduleDateKey',
   'sendTelegramMessage'
 ]);
 
@@ -59,10 +61,7 @@ const previewRows = [
 ];
 const previewGroups = groupPendingRows(previewRows);
 assert.strictEqual(formatScheduleDate('06 Sept 2026'), '6th September');
-assert.strictEqual(
-  formatScheduleDate('6 Sept'),
-  '6th September'
-);
+assert.strictEqual(formatScheduleDate('6 Sept'), '6th September');
 assert.strictEqual(formatZoomStartTime('06 Sept 2026', '04:00PM - 05:00PM'), '2026-09-06T16:00:00');
 assert.strictEqual(getZoomDurationMins('04:00PM - 05:00PM'), 60);
 assert.strictEqual(formatZoomStartTime('06 Sept 2026', '11:00AM - 12:30PM'), '2026-09-06T11:00:00');
@@ -171,8 +170,7 @@ assert.deepStrictEqual(
   expectedParsed
 );
 
-// 4. Test parseDateStrToVal with various date formats (including missing year, ordinal suffixes, reverse day/month)
-const year = new Date().getFullYear();
+// 4. Test parseDateStrToVal with various date formats
 assert.ok(parseDateStrToVal('06 Sept') > 0, '06 Sept without year should parse');
 assert.ok(parseDateStrToVal('6 Oct') > 0, '6 Oct without year should parse');
 assert.ok(parseDateStrToVal('Oct 6') > 0, 'Oct 6 reverse order should parse');
@@ -222,7 +220,6 @@ const existingRows = [
   ['20 Nov 2026', '05:00PM - 07:00PM', 'Laxmi Nagar', 'AIBE']
 ];
 
-// Case A: Insert 6 Oct 2026 (between 05 Oct and 18 Nov) -> should insert before Row 5 (18 Nov), returning Row 5!
 const insertIdx6Oct = findInsertionRowIndex(
   existingRows,
   parseDateStrToVal('6 Oct 2026'),
@@ -230,7 +227,6 @@ const insertIdx6Oct = findInsertionRowIndex(
 );
 assert.strictEqual(insertIdx6Oct, 5, '6 Oct class should be inserted at Row 5');
 
-// Case B: Insert 05 Oct 2026 @ 03:00PM (after 05 Oct 11:00AM and before 18 Nov) -> should insert before Row 5, returning Row 5!
 const insertIdx5OctAfternoon = findInsertionRowIndex(
   existingRows,
   parseDateStrToVal('05 Oct 2026'),
@@ -238,7 +234,6 @@ const insertIdx5OctAfternoon = findInsertionRowIndex(
 );
 assert.strictEqual(insertIdx5OctAfternoon, 5, '05 Oct 03:00PM class should be inserted at Row 5');
 
-// Case C: Insert 04 Oct 2026 @ 04:00PM (between 02:30PM and 05:00PM) -> should insert before Row 3 (05:00PM), returning Row 3!
 const insertIdx4OctMidday = findInsertionRowIndex(
   existingRows,
   parseDateStrToVal('04 Oct 2026'),
@@ -246,7 +241,6 @@ const insertIdx4OctMidday = findInsertionRowIndex(
 );
 assert.strictEqual(insertIdx4OctMidday, 3, '04 Oct 04:00PM class should be inserted at Row 3');
 
-// Case D: Insert 25 Nov 2026 (after all existing dates) -> should append at bottom (Row 7)
 const insertIdx25Nov = findInsertionRowIndex(
   existingRows,
   parseDateStrToVal('25 Nov 2026'),
@@ -254,7 +248,7 @@ const insertIdx25Nov = findInsertionRowIndex(
 );
 assert.strictEqual(insertIdx25Nov, 7, '25 Nov class should be appended at Row 7');
 
-// 6. Telegram-created rows keep the GAS status in G and store the Calendar event ID in H
+// 6. Telegram-created rows keep GAS status in G and Calendar event ID in H
 const scheduleRowValues = createScheduleRowValues({
   date: '07 Oct 2026',
   time: '03:00PM - 05:00PM',
@@ -369,49 +363,6 @@ async function testCalendarAndRowDeletion() {
   assert.strictEqual(await deleteCalendarEvent(notFoundCalendar, 'calendar-id', 'stale-id'), 'not-found');
   assert.ok(telegramCommands.some(command => command.command === 'help'));
   assert.ok(telegramCommands.some(command => command.command === 'delete'));
-}
-
-async function testWhatsAppReauthRequest() {
-  const calls = [];
-  const response = await requestWhatsAppReauth(async (url, options) => {
-    calls.push({ url: String(url), options });
-    return {
-      ok: true,
-      status: 202,
-      text: async () => JSON.stringify({ success: true, started: true })
-    };
-  }, {
-    RENDER_REAUTH_URL: 'https://tcr-bot.example/reauth',
-    RENDER_REAUTH_TOKEN: 'shared-secret'
-  });
-
-  assert.deepStrictEqual(response, { success: true, started: true });
-  assert.strictEqual(calls[0].url, 'https://tcr-bot.example/reauth');
-  assert.strictEqual(calls[0].options.method, 'POST');
-  assert.strictEqual(calls[0].options.headers.Authorization, 'Bearer shared-secret');
-  assert.strictEqual(calls[0].options.signal.aborted, false);
-  await assert.rejects(
-    () => requestWhatsAppReauth(async () => { throw new Error('fetch should not run'); }, {}),
-    /Add the Render endpoint URL and shared re-auth token to Vercel/
-  );
-  await assert.rejects(
-    () => requestWhatsAppReauth(async () => ({
-      ok: false,
-      status: 401,
-      text: async () => JSON.stringify({ success: false, message: 'Unauthorized.' })
-    }), {
-      RENDER_REAUTH_URL: 'https://tcr-bot.example/reauth',
-      RENDER_REAUTH_TOKEN: 'wrong-secret'
-    }),
-    error => error.userMessage.includes('Verify the shared re-auth token matches')
-  );
-  await assert.rejects(
-    () => requestWhatsAppReauth(async () => {}, {
-      RENDER_REAUTH_URL: 'http://tcr-bot.example/reauth',
-      RENDER_REAUTH_TOKEN: 'shared-secret'
-    }),
-    /valid HTTPS URL ending in \/reauth/
-  );
 }
 
 assert.deepStrictEqual(
@@ -548,8 +499,7 @@ Promise.all([
   testHealthEndpoint(),
   testOperationalGuards(),
   testExplicitScheduleRowWrite(),
-  testCalendarAndRowDeletion(),
-  testWhatsAppReauthRequest()
+  testCalendarAndRowDeletion()
 ])
   .then(() => console.log('All Telegram schedule bot tests passed successfully!'))
   .catch(error => {
