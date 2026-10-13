@@ -185,7 +185,8 @@ async function fetchPendingRows() {
     range: `'${sheet.title.replace(/'/g, "''")}'!A1:I`
   });
   const rows = response.data.values || [];
-  const today = todayInIndia();
+  const today = indiaDateKey(0);
+  const tomorrow = indiaDateKey(1);
   return rows.slice(1).map((values, index) => ({
     rowIndex: index + 2,
     date: String(values[0] || '').trim(),
@@ -199,7 +200,7 @@ async function fetchPendingRows() {
   })).filter(row => {
     const dateKey = scheduleDateKey(row.date);
     const complete = [row.date, row.time, row.center, row.course, row.subject, row.faculty].every(Boolean);
-    return complete && dateKey && dateKey >= today && row.status !== 'SENT';
+    return complete && dateKey && (dateKey === today || dateKey === tomorrow) && row.status !== 'SENT';
   });
 }
 
