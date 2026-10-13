@@ -1,5 +1,7 @@
 const assert = require('assert');
 const telegramWebhook = require('./api/index');
+const preview = require('./lib/preview');
+const { formatZoomStartTime, getZoomDurationMins } = require('./lib/zoom');
 
 const {
   _getMissingConfiguration: getMissingConfiguration,
@@ -18,10 +20,101 @@ const {
   _deleteCalendarEvent: deleteCalendarEvent,
   _deleteScheduleRow: deleteScheduleRow,
   _telegramCommands: telegramCommands,
-  _requestWhatsAppReauth: requestWhatsAppReauth
+  _requestWhatsAppReauth: requestWhatsAppReauth,
+  _isValidCronAuthorization: isValidCronAuthorization
 } = telegramWebhook;
 
+const {
+  groupPendingRows,
+  callbackSignature,
+  formatGroupMessage,
+  formatScheduleDate,
+  buildKeyboard
+} = preview;
+
 console.log('Running search/filter, natural input & chronological sorting tests...');
+assert.deepStrictEqual(Object.keys(preview).sort(), [
+  'answerCallbackQuery',
+  'buildKeyboard',
+  'callbackSignature',
+  'fetchPendingRows',
+  'formatGroupMessage',
+  'formatScheduleDate',
+  'groupPendingRows',
+  'markRowsSent',
+  'prepareZoomSend',
+  'runPreview',
+  'sendTelegramMessage'
+]);
+
+const previewRows = [
+  {
+    rowIndex: 4, date: '06 Sept 2026', time: '4:00 - 6:00PM', center: 'Laxmi Nagar',
+    course: 'CLAT', subject: 'Legal', faculty: 'Shivam Sir', status: '', zoomUrl: ''
+  },
+  {
+    rowIndex: 5, date: '06 Sept 2026', time: '6:00 - 8:00PM', center: 'Laxmi Nagar',
+    course: 'CLAT', subject: 'English', faculty: 'Anand Sir', status: '', zoomUrl: ''
+  }
+];
+const previewGroups = groupPendingRows(previewRows);
+assert.strictEqual(formatScheduleDate('06 Sept 2026'), '6th September');
+assert.strictEqual(
+  formatScheduleDate('6 Sept'),
+  '6th September'
+);
+assert.strictEqual(formatZoomStartTime('06 Sept 2026', '04:00PM - 05:00PM'), '2026-09-06T16:00:00');
+assert.strictEqual(getZoomDurationMins('04:00PM - 05:00PM'), 60);
+assert.strictEqual(formatZoomStartTime('06 Sept 2026', '11:00AM - 12:30PM'), '2026-09-06T11:00:00');
+assert.strictEqual(getZoomDurationMins('11:00AM - 12:30PM'), 90);
+assert.strictEqual(formatZoomStartTime('06 Sept 2026', '12:50PM - 02:20PM'), '2026-09-06T12:50:00');
+assert.strictEqual(getZoomDurationMins('12:50PM - 02:20PM'), 90);
+assert.strictEqual(formatZoomStartTime('06 Sept 2026', '04:00 - 05:00PM'), '2026-09-06T16:00:00');
+assert.strictEqual(previewGroups.length, 1, 'Classes for the same date, center, and course should group together');
+assert.deepStrictEqual(previewGroups[0].rowIndices, [4, 5]);
+assert.match(formatGroupMessage(previewGroups[0]), /\*Zoom:\* Link not prepared/);
+assert.strictEqual(
+  buildKeyboard(previewGroups[0]).inline_keyboard[0][0].text,
+  '🎥 Generate Zoom & Prepare Send'
+);
+previewRows.forEach(row => {
+  row.zoomUrl = `https://zoom.us/j/${row.rowIndex}`;
+});
+const preparedGroup = groupPendingRows(previewRows)[0];
+assert.strictEqual(
+  formatGroupMessage(preparedGroup),
+  [
+    '*TCR – CLAT CLASS FLOW*',
+    '',
+    '*Class Schedule*',
+    '📌 6th September',
+    '',
+    '*4:00 - 6:00PM*',
+    'Subject: *Legal*',
+    'Faculty: *SHIVAM SIR*',
+    '🔗 *Zoom:* https://zoom.us/j/4',
+    '',
+    '*6:00 - 8:00PM*',
+    'Subject: *English*',
+    'Faculty: *ANAND SIR*',
+    '🔗 *Zoom:* https://zoom.us/j/5',
+    '',
+    'Regards,',
+    '*TEAM TCR*'
+  ].join('\n')
+);
+const preparedKeyboard = buildKeyboard(preparedGroup).inline_keyboard;
+assert.strictEqual(preparedKeyboard[0][0].text, '📤 Open WhatsApp');
+assert.ok(preparedKeyboard[0][0].url.startsWith('https://wa.me/?text='));
+assert.strictEqual(preparedKeyboard[1][0].text, '✅ Mark as sent');
+previewRows.forEach(row => {
+  row.status = 'SENT';
+});
+const sentKeyboard = buildKeyboard(groupPendingRows(previewRows)[0]).inline_keyboard;
+assert.strictEqual(sentKeyboard[0][0].text, '📤 Send to WhatsApp');
+assert.strictEqual(sentKeyboard.length, 1, 'Already-sent rows should remain resendable without another mark action');
+assert.strictEqual(isValidCronAuthorization('Bearer cron-secret', 'cron-secret'), true);
+assert.strictEqual(isValidCronAuthorization('Bearer wrong-secret', 'cron-secret'), false);
 
 // 1. Date normalization tests (leading zero handling & month abbrev)
 assert.strictEqual(normalizeText('01 Oct 2026'), '1 oct 2026');
