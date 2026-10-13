@@ -1,5 +1,16 @@
 const { google } = require('googleapis');
 const https = require('https');
+const {
+  runPreview,
+  markRowsSent,
+  prepareZoomSend,
+  sendTelegramMessage,
+  answerCallbackQuery,
+  fetchPendingRows,
+  groupPendingRows,
+  callbackSignature
+} = require('../lib/preview');
+const { getGoogleAuth } = require('../lib/googleAuth');
 
 // Configuration Constants
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
@@ -16,6 +27,7 @@ const TELEGRAM_COMMANDS = [
   { command: 'create', description: 'Add a class to the schedule' },
   { command: 'update', description: 'Update a schedule row' },
   { command: 'delete', description: 'Delete a class and its linked event' },
+  { command: 'preview', description: 'Prepare upcoming class messages for WhatsApp' },
   { command: 'reauth', description: 'Manually trigger WhatsApp re-authentication' }
 ];
 
@@ -328,62 +340,6 @@ function parseCreateArgs(argsStr) {
   return null;
 }
 
-// Helper to authenticate with Google Auth (Sheets & Calendar)
-function getGoogleAuth() {
-  let auth;
-  if (process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
-    let rawKey = process.env.GOOGLE_SERVICE_ACCOUNT_KEY.trim();
-
-    // Step 1: Base64 decode if passed as base64 string
-    if (!rawKey.startsWith('{') && !rawKey.startsWith('"') && !rawKey.startsWith("'")) {
-      try {
-        const decoded = Buffer.from(rawKey, 'base64').toString('utf8');
-        if (decoded.includes('{')) {
-          rawKey = decoded.trim();
-        }
-      } catch (e) {
-        console.error('Base64 decode attempt failed:', e.message);
-      }
-    }
-
-    // Step 2: Strip surrounding quotes if present
-    if ((rawKey.startsWith('"') && rawKey.endsWith('"')) || (rawKey.startsWith("'") && rawKey.endsWith("'"))) {
-      rawKey = rawKey.substring(1, rawKey.length - 1).trim();
-    }
-
-    // Step 3: Extract valid JSON substring from first '{' to last '}'
-    const firstBrace = rawKey.indexOf('{');
-    const lastBrace = rawKey.lastIndexOf('}');
-    if (firstBrace !== -1 && lastBrace > firstBrace) {
-      rawKey = rawKey.substring(firstBrace, lastBrace + 1);
-    }
-
-    // Step 4: Parse JSON
-    let credentials = JSON.parse(rawKey);
-
-    // Step 5: Format newlines in private_key
-    if (credentials.private_key && typeof credentials.private_key === 'string') {
-      credentials.private_key = credentials.private_key.replace(/\\n/g, '\n');
-    }
-
-    auth = new google.auth.GoogleAuth({
-      credentials,
-      scopes: [
-        'https://www.googleapis.com/auth/spreadsheets',
-        'https://www.googleapis.com/auth/calendar'
-      ]
-    });
-  } else {
-    auth = new google.auth.GoogleAuth({
-      scopes: [
-        'https://www.googleapis.com/auth/spreadsheets',
-        'https://www.googleapis.com/auth/calendar'
-      ]
-    });
-  }
-  return auth;
-}
-
 function getSheetsClient() {
   const auth = getGoogleAuth();
   return google.sheets({ version: 'v4', auth });
@@ -527,54 +483,6 @@ async function resolveSheetDetails(sheets) {
   };
 }
 
-// Telegram Message Sender Helper
-function sendTelegramMessage(chatId, text, parseMode = 'Markdown') {
-  return new Promise((resolve, reject) => {
-    const data = JSON.stringify({
-      chat_id: chatId,
-      text: text,
-      parse_mode: parseMode
-    });
-
-    const options = {
-      hostname: 'api.telegram.org',
-      port: 443,
-      path: `/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(data)
-      }
-    };
-
-    const req = https.request(options, (res) => {
-      let body = '';
-      res.on('data', chunk => body += chunk);
-      res.on('end', () => {
-        let response;
-        try {
-          response = JSON.parse(body);
-        } catch {
-          reject(new Error('Telegram API returned an invalid response.'));
-          return;
-        }
-
-        if (res.statusCode < 200 || res.statusCode >= 300 || response.ok !== true) {
-          reject(new Error(`Telegram API request failed: ${response.description || res.statusCode}`));
-          return;
-        }
-
-        resolve(response.result);
-      });
-    });
-
-    req.on('error', (e) => reject(e));
-    req.setTimeout(10000, () => req.destroy(new Error('Telegram API request timed out.')));
-    req.write(data);
-    req.end();
-  });
-}
-
 function setTelegramCommandMenu() {
   const data = JSON.stringify({ commands: TELEGRAM_COMMANDS });
 
@@ -681,8 +589,65 @@ function isAuthorized(chatId, userId) {
   return strChatId === String(AUTHORIZED_CHAT_ID) || strUserId === String(AUTHORIZED_CHAT_ID);
 }
 
+function isValidCronAuthorization(authorization, expectedSecret = process.env.CRON_SECRET) {
+  if (typeof authorization !== 'string' || !expectedSecret) return false;
+  const suppliedSecret = authorization.match(/^Bearer (.+)$/i)?.[1];
+  if (!suppliedSecret) return false;
+  const supplied = Buffer.from(suppliedSecret);
+  const expected = Buffer.from(expectedSecret);
+  return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
+}
+
+async function handlePreviewCallback(callbackQuery) {
+  const match = String(callbackQuery.data || '').match(/^(prepare|sent):(\d+):([a-f0-9]{8})$/);
+  if (!match) {
+    await answerCallbackQuery(callbackQuery.id, 'This preview action is invalid.');
+    return;
+  }
+
+  const rows = await fetchPendingRows();
+  const group = groupPendingRows(rows).find(candidate => candidate.rowIndices.includes(Number(match[2])));
+  if (!group || callbackSignature(group) !== match[3]) {
+    await answerCallbackQuery(callbackQuery.id, 'This preview is out of date. Run /preview again.');
+    return;
+  }
+
+  if (match[1] === 'prepare') {
+    await prepareZoomSend(group.rowIndices);
+    await answerCallbackQuery(callbackQuery.id, 'Zoom links prepared. The WhatsApp message is ready.');
+    return;
+  }
+
+  await markRowsSent(group.rowIndices);
+  await answerCallbackQuery(callbackQuery.id, 'Schedule rows marked as sent.');
+}
+
 // Vercel Serverless Entry Point
 module.exports = async (req, res) => {
+  const pathname = new URL(req.url || '/', 'https://vercel.invalid').pathname;
+  if (pathname === '/api/cron') {
+    if (req.method !== 'GET') {
+      res.status(405).json({ ok: false, error: 'Method not allowed.' });
+      return;
+    }
+    if (!process.env.CRON_SECRET) {
+      res.status(500).json({ ok: false, error: 'CRON_SECRET is not configured.' });
+      return;
+    }
+    if (!isValidCronAuthorization(req.headers?.authorization)) {
+      res.status(401).json({ ok: false, error: 'Invalid cron authorization.' });
+      return;
+    }
+    try {
+      const groupsSent = await runPreview(AUTHORIZED_CHAT_ID);
+      res.status(200).json({ ok: true, groupsSent });
+    } catch (error) {
+      console.error('Scheduled preview failed:', error);
+      res.status(500).json({ ok: false, error: 'Scheduled preview failed.' });
+    }
+    return;
+  }
+
   if (req.method !== 'POST') {
     res.status(200).send('TCR Telegram Bot Webhook API is running.');
     return;
@@ -705,6 +670,23 @@ module.exports = async (req, res) => {
 
   try {
     const payload = req.body || {};
+
+    if (payload.callback_query) {
+      const callbackQuery = payload.callback_query;
+      const chatId = callbackQuery.message?.chat?.id;
+      const userId = callbackQuery.from?.id;
+      if (!isAuthorized(chatId, userId)) {
+        await answerCallbackQuery(callbackQuery.id, 'Access denied.');
+        res.status(200).json({ ok: true });
+        return;
+      }
+      try {
+        await handlePreviewCallback(callbackQuery);
+      } catch (error) {
+        console.error('Preview callback failed:', error);
+        await answerCallbackQuery(callbackQuery.id, `Action failed: ${error.message}`);
+      }
+    }
 
     if (payload.message && payload.message.text) {
       const message = payload.message;
@@ -762,6 +744,8 @@ async function handleTelegramCommand(chatId, text) {
       `Delete row. Example: \`/delete 15\`\n\n` +
       `📌 */check*\n` +
       `Check bot online status and pending dispatches.\n\n` +
+      `📌 */preview*\n` +
+      `Preview upcoming classes, prepare Zoom links, and open a WhatsApp-ready message.\n\n` +
       `📌 */reauth*\n` +
       `Manually trigger WhatsApp re-authentication. Use this if you logged out WhatsApp or need to reconnect.\n\n` +
       `🗑️ When you use */delete*, the bot also deletes the linked Calendar event stored in column H. Deleting a row directly in Sheets does not trigger this cleanup.`;
@@ -817,6 +801,11 @@ async function handleTelegramCommand(chatId, text) {
 
     if (command === '/delete') {
       await handleDeleteCommand(chatId, argsStr);
+      return;
+    }
+
+    if (command === '/preview') {
+      await runPreview(chatId);
       return;
     }
 
@@ -1027,12 +1016,20 @@ async function handleUpdateCommand(chatId, argsStr) {
   // Check if pipe or comma separated full row update
   const parsed = parseCreateArgs(restStr);
   if (parsed && hasCompleteScheduleDetails(parsed)) {
-    await sheets.spreadsheets.values.update({
+    await sheets.spreadsheets.values.batchUpdate({
       spreadsheetId: SPREADSHEET_ID,
-      range: `'${sheetDetails.title}'!A${rowNum}:G${rowNum}`,
-      valueInputOption: 'USER_ENTERED',
       requestBody: {
-        values: [[parsed.date, parsed.time, parsed.center, parsed.course, parsed.subject, parsed.faculty, '']]
+        valueInputOption: 'USER_ENTERED',
+        data: [
+          {
+            range: `'${sheetDetails.title}'!A${rowNum}:G${rowNum}`,
+            values: [[parsed.date, parsed.time, parsed.center, parsed.course, parsed.subject, parsed.faculty, '']]
+          },
+          {
+            range: `'${sheetDetails.title}'!I${rowNum}`,
+            values: [['']]
+          }
+        ]
       }
     });
     await sendTelegramMessage(chatId, `✅ *Row ${rowNum} updated completely!*`);
@@ -1078,14 +1075,22 @@ async function handleUpdateCommand(chatId, argsStr) {
     }
   });
 
-  // Clear SENT status if details were modified
+  // Changes to class details invalidate both the dispatch status and stored Zoom link.
   if (fieldName !== 'status') {
-    await sheets.spreadsheets.values.update({
+    await sheets.spreadsheets.values.batchUpdate({
       spreadsheetId: SPREADSHEET_ID,
-      range: `'${sheetDetails.title}'!G${rowNum}`,
-      valueInputOption: 'USER_ENTERED',
       requestBody: {
-        values: [['']]
+        valueInputOption: 'USER_ENTERED',
+        data: [
+          {
+            range: `'${sheetDetails.title}'!G${rowNum}`,
+            values: [['']]
+          },
+          {
+            range: `'${sheetDetails.title}'!I${rowNum}`,
+            values: [['']]
+          }
+        ]
       }
     });
   }
@@ -1151,3 +1156,4 @@ module.exports._deleteScheduleRow = deleteScheduleRow;
 module.exports._setTelegramCommandMenu = setTelegramCommandMenu;
 module.exports._telegramCommands = TELEGRAM_COMMANDS;
 module.exports._requestWhatsAppReauth = requestWhatsAppReauth;
+module.exports._isValidCronAuthorization = isValidCronAuthorization;

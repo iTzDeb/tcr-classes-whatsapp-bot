@@ -52,7 +52,7 @@ The Vercel project uses the repository’s `telegram/vercel.json`. Do not set it
 
 ## 3. Shared Google Sheet contract
 
-The schedule tab is named **`Schedule`**. Rows begin at row 2; row 1 is the header. The WhatsApp GAS code uses columns A–H:
+The schedule tab is named **`Schedule`**. Rows begin at row 2; row 1 is the header. The WhatsApp GAS code uses columns A–H; the Telegram preview also uses column I:
 
 | Column | Field | Meaning / writer |
 | --- | --- | --- |
@@ -62,8 +62,9 @@ The schedule tab is named **`Schedule`**. Rows begin at row 2; row 1 is the head
 | D | Course | Course/batch; used in message grouping and routing. Required. |
 | E | Subject | Subject. Required. |
 | F | Faculty | Faculty. Required. |
-| G | Status | Empty/non-`SENT` means pending for the WhatsApp dispatcher. `SENT` means GAS received a Render acknowledgement. Telegram `/update` clears this status when class details change; an operator may also edit it manually. |
+| G | Status | Empty/non-`SENT` means pending for the WhatsApp dispatcher. `SENT` means GAS received a Render acknowledgement or an operator confirmed delivery in Telegram `/preview`. Telegram `/update` clears this status and the stored Zoom URL when class details change; an operator may also edit it manually. |
 | H | Calendar event ID | GAS calendar sync stores `CalendarEvent.getId()`. The Telegram app currently stores Google Calendar API `iCalUID` on create. Confirm that these identifiers work with the specific GAS calendar operation before relying on cross-app updates/deletes; test with a copy of the sheet/calendar first. |
+| I | Zoom URL | Add the `Zoom URL` header in I1. Telegram `/preview` stores generated Laxmi Nagar meeting URLs here and reuses them for the prepared WhatsApp message. |
 
 The **`Settings`** tab contains rows mapping Center (A), Course (B), and one or more comma-separated WhatsApp group JIDs (C). The key is normalized by the dispatcher to `center_course`, e.g. `laxmi nagar_gs foundation`. Verify spelling and JIDs carefully: a missing mapping prevents delivery for that group.
 
