@@ -277,7 +277,7 @@ function formatScheduleDate(dateValue) {
 
 function formatGroupMessage(group) {
   const message = [
-    `*TCR – ${group.course.toUpperCase()} CLASS FLOW${centerCode(group.center) ? ` (${centerCode(group.center)})` : ''}*`,
+    `*TCR - ${group.course.toUpperCase()} CLASS FLOW${centerCode(group.center) ? ` (${centerCode(group.center)})` : ''}*`,
     '',
     '*Class Schedule*',
     `📌 ${formatScheduleDate(group.date)}`,

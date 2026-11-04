@@ -144,7 +144,7 @@ const preparedGroup = groupPendingRows(previewRows)[0];
 assert.strictEqual(
   formatGroupMessage(preparedGroup),
   [
-    '*TCR – CLAT CLASS FLOW (LN)*',
+    '*TCR - CLAT CLASS FLOW (LN)*',
     '',
     '*Class Schedule*',
     '📌 6th September',
@@ -173,7 +173,7 @@ const hauzKhasGroup = groupPendingRows([{
   zoomUrl: 'https://zoom.us/j/987654321'
 }])[0];
 const hauzKhasMessage = formatGroupMessage(hauzKhasGroup);
-assert.ok(hauzKhasMessage.startsWith('*TCR – CLAT/CUET/CLAT 28 CLASS FLOW (HK)*'));
+assert.ok(hauzKhasMessage.startsWith('*TCR - CLAT/CUET/CLAT 28 CLASS FLOW (HK)*'));
 assert.doesNotMatch(hauzKhasMessage, /Zoom/,
   'Hauz Khas schedules must not show Zoom links, even if a stale link is stored in the sheet');
 previewRows.forEach(row => {
