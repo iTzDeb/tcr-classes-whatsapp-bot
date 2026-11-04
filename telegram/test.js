@@ -1,7 +1,7 @@
 const assert = require('assert');
 const telegramWebhook = require('./api/index');
 const preview = require('./lib/preview');
-const { formatZoomStartTime, getZoomDurationMins } = require('./lib/zoom');
+const { formatZoomStartTime, getZoomDurationMins, extractZoomMeetingId, syncZoomMeeting } = require('./lib/zoom');
 
 const {
   _getMissingConfiguration: getMissingConfiguration,
@@ -25,6 +25,7 @@ const {
 
 const {
   groupPendingRows,
+  isPendingPreviewRow,
   callbackSignature,
   formatGroupMessage,
   formatScheduleDate,
@@ -32,6 +33,64 @@ const {
 } = preview;
 
 console.log('Running search/filter, natural input & chronological sorting tests...');
+
+const tomorrowClass = {
+  date: '05 Nov 2026', time: '04:00PM - 06:00PM', center: 'Laxmi Nagar',
+  course: 'CLAT', subject: 'Legal', faculty: 'Shivam Sir', status: ''
+};
+assert.strictEqual(isPendingPreviewRow({ ...tomorrowClass, date: '04 Nov 2026' }, '2026-11-05'), false,
+  'Preview must not include today’s classes');
+assert.strictEqual(isPendingPreviewRow(tomorrowClass, '2026-11-05'), true,
+  'Preview should include complete pending classes for tomorrow');
+assert.strictEqual(isPendingPreviewRow({ ...tomorrowClass, status: 'SENT' }, '2026-11-05'), false,
+  'Preview must not include classes already marked sent');
+assert.strictEqual(isPendingPreviewRow({ ...tomorrowClass, faculty: '' }, '2026-11-05'), false,
+  'Preview must not include incomplete schedule rows');
+
+assert.strictEqual(extractZoomMeetingId('https://us02web.zoom.us/j/123456789?pwd=abc'), '123456789');
+assert.strictEqual(extractZoomMeetingId('https://evil.example/j/123456789'), null,
+  'Only Zoom meeting URLs should be accepted');
+
+async function testZoomMeetingSyncUsesCurrentSchedule() {
+  const calls = [];
+  const env = {
+    ZOOM_ACCOUNT_ID: process.env.ZOOM_ACCOUNT_ID,
+    ZOOM_CLIENT_ID: process.env.ZOOM_CLIENT_ID,
+    ZOOM_CLIENT_SECRET: process.env.ZOOM_CLIENT_SECRET
+  };
+  process.env.ZOOM_ACCOUNT_ID = 'account';
+  process.env.ZOOM_CLIENT_ID = 'client';
+  process.env.ZOOM_CLIENT_SECRET = 'secret';
+  const fetchImpl = async (url, options) => {
+    calls.push({ url, options });
+    return calls.length === 1
+      ? { ok: true, json: async () => ({ access_token: 'access-token' }) }
+      : { ok: true, json: async () => ({}) };
+  };
+  try {
+    await syncZoomMeeting({
+      rowIndex: 7, date: '05 Nov 2026', time: '04:00PM - 06:00PM',
+      center: 'Laxmi Nagar', course: 'CLAT', subject: 'Updated Legal', faculty: 'New Faculty',
+      zoomUrl: 'https://zoom.us/j/123456789?pwd=abc'
+    }, fetchImpl);
+    assert.strictEqual(calls.length, 2, 'Sync should authenticate and update the existing Zoom meeting');
+    assert.match(calls[1].url, /\/meetings\/123456789$/);
+    assert.strictEqual(calls[1].options.method, 'PUT');
+    assert.deepStrictEqual(JSON.parse(calls[1].options.body), {
+      topic: 'TCR Laxmi Nagar CLAT - Updated Legal (New Faculty)',
+      type: 2,
+      start_time: '2026-11-05T16:00:00',
+      duration: 120,
+      timezone: 'Asia/Kolkata'
+    });
+  } finally {
+    for (const [name, value] of Object.entries(env)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
+
 assert.deepStrictEqual(Object.keys(preview).sort(), [
   'answerCallbackQuery',
   'buildKeyboard',
@@ -42,6 +101,7 @@ assert.deepStrictEqual(Object.keys(preview).sort(), [
   'formatScheduleDate',
   'groupPendingRows',
   'indiaDateKey',
+  'isPendingPreviewRow',
   'markRowsSent',
   'prepareZoomSend',
   'runPreview',
@@ -499,7 +559,8 @@ Promise.all([
   testHealthEndpoint(),
   testOperationalGuards(),
   testExplicitScheduleRowWrite(),
-  testCalendarAndRowDeletion()
+  testCalendarAndRowDeletion(),
+  testZoomMeetingSyncUsesCurrentSchedule()
 ])
   .then(() => console.log('All Telegram schedule bot tests passed successfully!'))
   .catch(error => {

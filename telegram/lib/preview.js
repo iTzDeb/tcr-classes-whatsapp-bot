@@ -2,7 +2,7 @@ const https = require('https');
 const crypto = require('crypto');
 const { google } = require('googleapis');
 const { getGoogleAuth } = require('./googleAuth');
-const { createZoomMeeting } = require('./zoom');
+const { createZoomMeeting, syncZoomMeeting } = require('./zoom');
 
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -176,6 +176,11 @@ function callbackSignature(group) {
   return crypto.createHash('sha256').update(`${group.key}|${rows}`).digest('hex').slice(0, 8);
 }
 
+function isPendingPreviewRow(row, targetDateKey) {
+  const complete = [row.date, row.time, row.center, row.course, row.subject, row.faculty].every(Boolean);
+  return complete && scheduleDateKey(row.date) === targetDateKey && row.status !== 'SENT';
+}
+
 async function fetchPendingRows() {
   if (!SPREADSHEET_ID) throw new Error('SPREADSHEET_ID is not configured.');
   const sheets = getSheetsClient();
@@ -185,7 +190,6 @@ async function fetchPendingRows() {
     range: `'${sheet.title.replace(/'/g, "''")}'!A1:I`
   });
   const rows = response.data.values || [];
-  const today = indiaDateKey(0);
   const tomorrow = indiaDateKey(1);
   return rows.slice(1).map((values, index) => ({
     rowIndex: index + 2,
@@ -197,11 +201,7 @@ async function fetchPendingRows() {
     faculty: String(values[5] || '').trim(),
     status: String(values[6] || '').trim().toUpperCase(),
     zoomUrl: String(values[8] || '').trim()
-  })).filter(row => {
-    const dateKey = scheduleDateKey(row.date);
-    const complete = [row.date, row.time, row.center, row.course, row.subject, row.faculty].every(Boolean);
-    return complete && dateKey && (dateKey === today || dateKey === tomorrow) && row.status !== 'SENT';
-  });
+  })).filter(row => isPendingPreviewRow(row, tomorrow));
 }
 
 async function fetchAllRows() {
@@ -315,7 +315,9 @@ function buildKeyboard(group) {
 }
 
 async function runPreview(chatId) {
-  const groups = groupPendingRows(await fetchPendingRows());
+  const rows = await fetchPendingRows();
+  await Promise.all(rows.filter(row => row.zoomUrl).map(syncZoomMeeting));
+  const groups = groupPendingRows(rows);
   if (!groups.length) {
     await sendTelegramMessage(chatId, '📅 No upcoming pending or prepared classes were found.');
     return 0;
@@ -360,11 +362,15 @@ async function readRowsByIndex(rowIndices) {
   return { sheets, sheet, rows: result };
 }
 
-async function prepareZoomSend(rowIndices) {
+async function prepareZoomSend(rowIndices, chatId = AUTHORIZED_CHAT_ID) {
   const { sheets, sheet, rows } = await readRowsByIndex(rowIndices);
   const values = [];
   for (const row of rows) {
-    if (!rowNeedsZoom(row) || row.zoomUrl) continue;
+    if (row.zoomUrl) {
+      await syncZoomMeeting(row);
+      continue;
+    }
+    if (!rowNeedsZoom(row)) continue;
     const zoomUrl = await createZoomMeeting(row);
     row.zoomUrl = zoomUrl;
     values.push({
@@ -382,7 +388,7 @@ async function prepareZoomSend(rowIndices) {
     });
   }
   const group = groupPendingRows(rows)[0];
-  await sendTelegramMessage(AUTHORIZED_CHAT_ID, formatGroupMessage(group), {
+  await sendTelegramMessage(chatId, formatGroupMessage(group), {
     parse_mode: 'Markdown',
     reply_markup: buildKeyboard(group)
   });
@@ -414,6 +420,7 @@ module.exports = {
   fetchPendingRows,
   fetchAllRows,
   groupPendingRows,
+  isPendingPreviewRow,
   callbackSignature,
   formatGroupMessage,
   formatScheduleDate,

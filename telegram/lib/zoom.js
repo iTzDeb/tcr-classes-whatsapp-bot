@@ -112,20 +112,14 @@ function formatZoomStartTime(dateValue, timeValue) {
   return `${year}-${month}-${day}T${hours}:${minutes}:00`;
 }
 
-async function createZoomMeeting(row) {
+async function getZoomAccessToken(fetchImpl) {
   const { ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET } = process.env;
   if (!ZOOM_ACCOUNT_ID || !ZOOM_CLIENT_ID || !ZOOM_CLIENT_SECRET) {
     throw new Error('Zoom is not configured. Set ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, and ZOOM_CLIENT_SECRET in Vercel.');
   }
 
-  const scheduleTime = parseScheduleTime(row.time);
-  const startTime = formatZoomStartTime(row.date, row.time);
-  if (!startTime) {
-    throw new Error(`Could not parse the schedule date/time for row ${row.rowIndex}.`);
-  }
-
   const credentials = Buffer.from(`${ZOOM_CLIENT_ID}:${ZOOM_CLIENT_SECRET}`).toString('base64');
-  const tokenResponse = await fetch(
+  const tokenResponse = await fetchImpl(
     `https://zoom.us/oauth/token?grant_type=account_credentials&account_id=${encodeURIComponent(ZOOM_ACCOUNT_ID)}`,
     {
       method: 'POST',
@@ -137,12 +131,68 @@ async function createZoomMeeting(row) {
   if (!tokenResponse.ok || !tokenBody.access_token) {
     throw new Error(`Zoom token request failed: ${tokenBody.reason || tokenBody.message || tokenResponse.status}`);
   }
+  return tokenBody.access_token;
+}
 
+function getZoomMeetingUpdate(row) {
+  const scheduleTime = parseScheduleTime(row.time);
+  const startTime = formatZoomStartTime(row.date, row.time);
+  if (!startTime || !scheduleTime) {
+    throw new Error(`Could not parse the schedule date/time for row ${row.rowIndex}.`);
+  }
+  return {
+    topic: `TCR ${row.center} ${row.course} - ${row.subject} (${row.faculty})`,
+    type: 2,
+    start_time: startTime,
+    duration: scheduleTime.durationMins,
+    timezone: 'Asia/Kolkata'
+  };
+}
+
+function extractZoomMeetingId(joinUrl) {
+  try {
+    const url = new URL(String(joinUrl || ''));
+    if (url.protocol !== 'https:' || !/(^|\.)zoom\.us$/i.test(url.hostname)) return null;
+    return url.pathname.match(/^\/j\/(\d+)\/?$/)?.[1] || null;
+  } catch {
+    return null;
+  }
+}
+
+async function syncZoomMeeting(row, fetchImpl = fetch) {
+  const meetingId = extractZoomMeetingId(row.zoomUrl);
+  if (!meetingId) throw new Error(`Stored Zoom URL for row ${row.rowIndex} is invalid; no meeting was updated.`);
+
+  const accessToken = await getZoomAccessToken(fetchImpl);
+  const meetingResponse = await fetchImpl(`${ZOOM_API_BASE_URL}/meetings/${meetingId}`, {
+    method: 'PUT',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json'
+    },
+    signal: AbortSignal.timeout(10000),
+    body: JSON.stringify(getZoomMeetingUpdate(row))
+  });
+  const meetingBody = await meetingResponse.json();
+  if (!meetingResponse.ok) {
+    throw new Error(`Zoom meeting update failed for row ${row.rowIndex}: ${meetingBody.message || meetingResponse.status}`);
+  }
+  return true;
+}
+
+async function createZoomMeeting(row) {
+  const scheduleTime = parseScheduleTime(row.time);
+  const startTime = formatZoomStartTime(row.date, row.time);
+  if (!startTime || !scheduleTime) {
+    throw new Error(`Could not parse the schedule date/time for row ${row.rowIndex}.`);
+  }
+
+  const accessToken = await getZoomAccessToken(fetch);
   const topic = `TCR ${row.center} ${row.course} - ${row.subject} (${row.faculty})`;
   const meetingResponse = await fetch(`${ZOOM_API_BASE_URL}/users/me/meetings`, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${tokenBody.access_token}`,
+      Authorization: `Bearer ${accessToken}`,
       'Content-Type': 'application/json'
     },
     signal: AbortSignal.timeout(10000),
@@ -170,6 +220,9 @@ async function createZoomMeeting(row) {
 
 module.exports = {
   createZoomMeeting,
+  syncZoomMeeting,
+  extractZoomMeetingId,
+  getZoomMeetingUpdate,
   formatZoomStartTime,
   getZoomDurationMins: timeValue => parseScheduleTime(timeValue)?.durationMins || null
 };
