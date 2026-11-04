@@ -1,8 +1,8 @@
 # TCR Classes Scheduling System — Operations Runbook
 
-This repository contains the operational documentation and WhatsApp dispatch bot for the TCR class schedule. It also contains the separately deployed Telegram schedule-management webhook under [`telegram/`](telegram/). The Telegram app runs independently on Vercel; the WhatsApp bot runs as a persistent Node.js service. Google Sheets is the shared schedule store, and the Google Apps Script (GAS) below connects the sheet, calendar, and WhatsApp dispatcher.
+This repository contains this operations runbook and the source for the separately deployed Telegram schedule-management webhook under [`telegram/`](telegram/). It does **not** contain the Render WhatsApp dispatcher or the Google Apps Script project: those are separate deployments, and the GAS code below is a documentation template. The Telegram app runs on Vercel and uses Google Sheets (and optionally Google Calendar); the external Render/GAS integration is described here for operator handover.
 
-This runbook is written for an operator taking over the system. It describes the current code and the GAS script supplied for this deployment; it is not a claim that the live Render settings, spreadsheet, Apps Script deployment, or triggers have been independently inspected. Replace every `YOUR_...` placeholder with the actual value from the appropriate provider. **Never put tokens, private keys, QR/session files, service-account JSON, or webhook secrets in this repository.**
+This runbook is for an operator taking over the system. Telegram behavior is based on the checked-in `telegram/` application; Render/GAS instructions are operational guidance for separately maintained deployments whose source is not included here. Live provider settings, the spreadsheet, Apps Script deployment, and triggers have not been independently inspected. Replace every `YOUR_...` placeholder with the actual value from the appropriate provider. **Never put tokens, private keys, QR/session files, service-account JSON, or webhook secrets in this repository.**
 
 ## 1. System overview
 
@@ -24,9 +24,9 @@ flowchart LR
 
 | Component | Source | Runtime / deploy root | Responsibility |
 | --- | --- | --- | --- |
-| WhatsApp dispatcher | This repository, root `index.js` | Render web service; `Procfile` starts `node index.js` | Keeps a Baileys WhatsApp Web connection open, fetches pending schedule rows through GAS, creates Zoom links when configured, sends schedule bundles to mapped WhatsApp groups, then posts row acknowledgements to GAS. |
+| WhatsApp dispatcher | Separately maintained; source is not included in this repository | Render web service, configured in its owning project | Keeps a Baileys WhatsApp Web connection open, fetches pending schedule rows through GAS, creates Zoom links when configured, sends schedule bundles to mapped WhatsApp groups, then posts row acknowledgements to GAS. |
 | Telegram schedule manager | This repository, `telegram/` | Vercel project `tcr-telegram-scheduler-bot`, root directory `telegram`, production branch `main` | Authorized admin commands to check, list, create, update, and delete schedule rows. `/create` may also create a Calendar event. This is not the WhatsApp group dispatcher. |
-| Google Apps Script | Script attached to the schedule spreadsheet | Google Apps Script Web App plus manually installed/time-driven triggers | Exposes pending rows and WhatsApp group settings to the Render bot, marks acknowledged rows `SENT`, syncs calendar events, triggers dispatch, and sends operational Telegram alerts. |
+| Google Apps Script | Externally managed project; §10 is a documentation template | Google Apps Script Web App plus manually installed/time-driven triggers | Exposes pending rows and WhatsApp group settings to the Render bot, marks acknowledged rows `SENT`, syncs calendar events, triggers dispatch, and sends operational Telegram alerts. |
 | Schedule data | Google spreadsheet | Google Sheets | Shared data contract for the three components. |
 | Optional Zoom integration | Zoom Server-to-Server OAuth app | Called by Render bot | Creates meeting links for configured centers. |
 
@@ -34,21 +34,21 @@ flowchart LR
 
 Avoid saying that every component “sends schedule announcements”; they do different jobs:
 
-* **WhatsApp group schedule announcements:** `index.js` / the Render daemon is the only component in this repository that sends the scheduled class bundle to WhatsApp groups. It selects rows that GAS returns as not `SENT`, groups them by center/course, and sends them to the group JIDs in the spreadsheet’s `Settings` tab.
+* **WhatsApp group schedule announcements:** the separately maintained Render daemon (not included in this repository) sends the scheduled class bundle to WhatsApp groups. As described by this runbook, it selects rows that GAS returns as not `SENT`, groups them by center/course, and sends them to the group JIDs in the spreadsheet’s `Settings` tab.
 * **Telegram schedule-management bot:** the Vercel app sends command replies to the administrator who invoked `/check`, `/list`, `/create`, `/update`, `/delete`, or `/reauth`. It does **not** broadcast class schedules to Telegram groups/channels.
-* **GAS in the code below:** does calendar synchronization, calls Render `/dispatch`, marks rows `SENT` after Render’s callback, and sends errors/QR-related alerts. Its `/check` handler replies to the Telegram chat that sent the command. It does **not** broadcast schedule announcements to Telegram channels.
+* **Google Apps Script (GAS) template in §10:** describes calendar synchronization, calls Render `/dispatch`, marks rows `SENT` after Render’s callback, and sends operational Telegram alerts. Its `/check` handler replies to the Telegram chat that sent the command. The template does **not** broadcast schedule announcements to Telegram channels.
 
-Thus, with the code documented here, the two bots are not both announcing the same class to Telegram audiences. The important shared-state hazard is **Column G (`SENT`)**: Render considers a row complete after a successful send to *at least one* target group. If a class routes to multiple groups and one send fails while another succeeds, the bot still acknowledges all bundled rows to GAS; GAS marks them `SENT`, and the failed group will not get an automatic retry. A later operator edit can clear the status and requeue the row, but may resend it to groups that already received it. Before changing dispatch semantics, consider replacing the single global status with per-destination delivery tracking and idempotency; that is a behavior change and is not implemented here.
+Thus, according to the documented behavior, the two bots are not both announcing the same class to Telegram audiences. The important shared-state hazard is **Column G (`SENT`)**: Render considers a row complete after a successful send to *at least one* target group. If a class routes to multiple groups and one send fails while another succeeds, the bot still acknowledges all bundled rows to GAS; GAS marks them `SENT`, and the failed group will not get an automatic retry. A later operator edit can clear the status and requeue the row, but may resend it to groups that already received it. Before changing dispatch semantics, consider replacing the single global status with per-destination delivery tracking and idempotency; that is a behavior change and is not implemented here.
 
 ## 2. Repository and deployment map
 
 * GitHub repository: `iTzDeb/tcr-classes-whatsapp-bot`
 * Production branch: `main`
-* Render service: use the service’s actual Dashboard URL; the repository has historically used different Render hostnames in different places. Confirm the live service domain rather than assuming an old URL remains valid.
+* Render service: use the service’s actual Dashboard URL; the repository has historically used different Render hostnames in different places. The daemon source is maintained separately, so verify its owning repository and deploy root. Confirm the live service domain rather than assuming an old URL remains valid.
 * Vercel project: `tcr-telegram-scheduler-bot` under the `deb-4379` team/account; root directory **`telegram`**; production branch **`main`**.
 * Stable Telegram production URL: `https://tcr-telegram-scheduler-bot.vercel.app/`
 
-The Vercel project uses the repository’s `telegram/vercel.json`. Do not set its root to the repository root: that would deploy the wrong app. The Vercel project can auto-deploy `main`; the Render project should also be connected to this repository/root as its service configuration requires. Never deploy or relink a project until you have checked its repository, branch, root directory, environment variables, and production domain.
+The Vercel project uses the repository’s `telegram/vercel.json`. Do not set its root to the repository root: that would deploy the wrong app. The Vercel project can auto-deploy `main`. Do not assume the Render project is connected to this repository; verify its actual source repository and deploy root. Never deploy or relink a project until you have checked its repository, branch, root directory, environment variables, and production domain.
 
 ## 3. Shared Google Sheet contract
 
@@ -202,14 +202,14 @@ GAS runs under the Google account that owns/deploys the script, not the Vercel s
 | `TELEGRAM_CHAT_ID` | Optional for alerts | Recipient for Render alerts and login QR. |
 | `RENDER_REAUTH_TOKEN` | Required for `/reauth` | High-entropy bearer token. Must exactly match Vercel’s `RENDER_REAUTH_TOKEN`; never commit or put it in a URL. |
 
-`CONFIG.APPS_SCRIPT_URL` is currently a literal in `index.js` and must be the deployed Apps Script Web App `/exec` URL. The Render host URL is also referenced by the GAS trigger and keep-alive functions; update both GAS properties/settings when the Render service hostname changes. Never commit a new Apps Script URL if your deployment treats it as an access secret.
+Configure the deployed Apps Script Web App `/exec` URL in the separately maintained Render daemon. That daemon’s source, including its `index.js`, is not included in this repository. The Render host URL is also referenced by the GAS trigger and keep-alive functions; update both GAS properties/settings when the Render service hostname changes. Never commit a new Apps Script URL if your deployment treats it as an access secret.
 
 ### Deploy
 
-The repository’s `Procfile` runs `node index.js`; `package.json` declares an ES module app. In the Render service, verify:
+The Render daemon described below is maintained outside this repository; there is no root-level `Procfile`, `package.json`, or `index.js` here. In the daemon’s owning project and Render service, verify:
 
-* It is a **Web Service** deployed from this repository and intended branch.
-* Build/install command installs the root `package.json` dependencies; start command is `node index.js` (or uses the repository `Procfile`).
+* It is a **Web Service** deployed from its owning source repository and intended branch.
+* Build/install and start commands match the daemon project’s manifest and entry point.
 * Required Zoom/Telegram environment values are set in Render’s secret settings.
 * Persistent disk or equivalent storage is enabled for `auth_info/` if the host supports it and the WhatsApp session must survive restarts. `auth_info/` is credentials and must never be committed or downloaded to shared storage.
 * The Render service’s actual public URL is reflected in GAS dispatch and health URLs.
@@ -244,7 +244,7 @@ The socket sets `markOnlineOnConnect: false` so it does not mark the linked devi
 
 ### WhatsApp group mapping
 
-`node getgroups.js` can print group JIDs after the project has a valid WhatsApp session. Treat JIDs as operational data. Add mappings in the Google Sheet `Settings` tab with Center, Course, and comma-separated group JIDs. Send a test only to a test group before updating production routing.
+If the separately maintained Render daemon provides a group-listing helper, run it in that project after establishing a valid WhatsApp session; no `getgroups.js` is present in this repository. Treat JIDs as operational data. Add mappings in the Google Sheet `Settings` tab with Center, Course, and comma-separated group JIDs. Send a test only to a test group before updating production routing.
 
 ## 8. Google Apps Script deployment and triggers
 
@@ -255,7 +255,7 @@ The socket sets `markOnlineOnConnect: false` so it does not mark the linked devi
 3. In **Project Settings → Script Properties**, set the required properties listed below. Do not store secrets in source code.
 4. In **Project Settings**, set the script timezone to the schedule’s intended timezone (the code uses local `Date`/`setHours` in places). For this schedule, confirm whether it should be `Asia/Kolkata`.
 5. Deploy → **New deployment** → **Web app**. Execute as the spreadsheet/script owner. Select the access policy that allows the Render service to call the web app. If that requires public/anonymous access, treat the `/exec` URL as sensitive: the supplied GAS code has no request authentication and its endpoints expose pending schedule/group data and accept row acknowledgements.
-6. Copy the deployed `/exec` URL into `APPS_SCRIPT_URL` in `index.js`, commit/review/deploy the Render app, and update the GAS Script Property `RENDER_DISPATCH_URL` with the actual Render host. Do not use the Apps Script test `/dev` URL for production.
+6. Configure the deployed `/exec` URL in the separately maintained Render daemon and deploy that app through its owning source project. The daemon source is not in this repository. Update the GAS Script Property `RENDER_DISPATCH_URL` with the actual Render host. Do not use the Apps Script test `/dev` URL for production.
 7. Authorize Calendar/Spreadsheet/UrlFetch scopes when prompted. Test `GET /exec` returns valid JSON containing `classes` and `settings`; test a callback only against a copied sheet before production use.
 8. Whenever code changes, create a new GAS deployment version and confirm the `/exec` deployment points to that version.
 
