@@ -2,6 +2,7 @@ const assert = require('assert');
 const telegramWebhook = require('./api/index');
 const preview = require('./lib/preview');
 const { formatZoomStartTime, getZoomDurationMins, extractZoomMeetingId, syncZoomMeeting } = require('./lib/zoom');
+const chatAccess = require('./lib/chatAccess');
 
 const {
   _getMissingConfiguration: getMissingConfiguration,
@@ -454,6 +455,30 @@ assert.strictEqual(
   'Incomplete class data must not be accepted as a complete row'
 );
 
+
+function createAuthorizedChatsSheets(){
+ let exists=false,rows=[]; const sheets={spreadsheets:{
+  get:async()=>({data:{sheets:exists?[{properties:{title:'AuthorizedChats',sheetId:12}}]:[]}}),
+  batchUpdate:async({requestBody})=>{if(requestBody.requests[0].addSheet){exists=true;return {data:{replies:[{addSheet:{properties:{title:'AuthorizedChats',sheetId:12}}}]}};}for(const q of requestBody.requests){const r=q.deleteDimension.range;rows.splice(r.startIndex,r.endIndex-r.startIndex);}return {data:{}};},
+  values:{update:async({requestBody})=>{rows=requestBody.values.map(x=>[...x]);return {data:{}};},get:async()=>({data:{values:rows.map(x=>[...x])}}),append:async({requestBody})=>{rows.push(...requestBody.values.map(x=>[...x]));return {data:{}};}}
+ }};return {sheets};
+}
+async function testChatAccess(){
+ assert.strictEqual(chatAccess.normalizeChatId(' -1001234567890 '),'-1001234567890');
+ assert.strictEqual(chatAccess.normalizeChatId('0'),null); assert.strictEqual(chatAccess.normalizeChatId('abc'),null);
+ assert.deepStrictEqual(telegramCommands.filter(x=>['status','pending','faculty'].includes(x.command)),[]);
+ const fixture=createAuthorizedChatsSheets(), opts={sheets:fixture.sheets,spreadsheetId:'sheet',initialChatId:'12345'};
+ assert.deepStrictEqual(await chatAccess.listAuthorizedChatIds(opts),['12345']);
+ assert.strictEqual(await chatAccess.addAuthorizedChatId({...opts,chatId:'-1001234567890'}),true);
+ assert.strictEqual(await chatAccess.addAuthorizedChatId({...opts,chatId:'-1001234567890'}),false);
+ assert.strictEqual(await chatAccess.isAuthorizedChat({...opts,chatId:'-1001234567890',userId:'77'}),true);
+ assert.strictEqual(await chatAccess.isAuthorizedChat({...opts,chatId:'555',userId:'77'}),false);
+ assert.strictEqual(await chatAccess.isAuthorizedChat({chatId:'555',userId:chatAccess.ADMIN_USER_ID}),true);
+ await assert.rejects(()=>chatAccess.removeAuthorizedChatId({...opts,chatId:chatAccess.ADMIN_USER_ID}),/permanently authorized/);
+ assert.strictEqual(await chatAccess.removeAuthorizedChatId({...opts,chatId:'-1001234567890'}),true);
+ assert.strictEqual(await chatAccess.isAuthorizedChat({...opts,chatId:'-1001234567890',userId:'77'}),false);
+}
+
 function createMockResponse() {
   return {
     statusCode: 0,
@@ -560,7 +585,8 @@ Promise.all([
   testOperationalGuards(),
   testExplicitScheduleRowWrite(),
   testCalendarAndRowDeletion(),
-  testZoomMeetingSyncUsesCurrentSchedule()
+  testZoomMeetingSyncUsesCurrentSchedule(),
+  testChatAccess()
 ])
   .then(() => console.log('All Telegram schedule bot tests passed successfully!'))
   .catch(error => {

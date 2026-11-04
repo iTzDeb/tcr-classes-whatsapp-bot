@@ -86,13 +86,17 @@ The Vercel Telegram app writes schedule rows directly through the Google Sheets 
 | --- | --- |
 | `/start`, `/help` | Show help. |
 | `/check` | Read the sheet and count rows with a date and status other than `SENT`. This confirms the bot responded and can read the schedule. |
+| `/preview` | Prepare only complete, unsent classes scheduled for tomorrow. Existing Zoom links are refreshed from the current sheet details before the preview is sent. |
 | `/list` | Show schedule rows. |
 | `/list <date or text>` | Filter by a date, center, course, subject, faculty, or keyword. |
 | `/create <class details>` or `/add <class details>` | Add a complete row in chronological order using an explicit A:H range, leaving G empty and storing the Calendar `iCalUID` in H. The entered class date/time is interpreted as Asia/Kolkata (IST) for Calendar creation. |
 | `/update <row> <field> <value>` | Update one field. Supported fields: Date, Time, Center, Course, Subject, Faculty, Status. Changing a detail field clears G for redispatch. |
 | `/update <row> <full row>` | Update A–G for a complete class. It clears G and leaves H untouched. Review calendar consistency after changing class date/time/details. |
 | `/delete <row>` | Delete the linked Calendar event in H, then permanently delete the schedule row. If Calendar deletion fails, the row is kept. If H is empty or the event is already gone, the bot reports that and deletes the row. |
+| `/chat add <chat-id>`, `/chat remove <chat-id>`, `/chat list` | Manage authorized chats in the administrator’s private Telegram chat only. IDs are stored in the spreadsheet’s `AuthorizedChats` tab. |
 | `/reauth` | Ask the Render daemon to start WhatsApp re-authentication when disconnected. If already connected, it reports that status without logging out the active session. |
+
+The `/chat` administrator is Telegram user ID `499900380`; the ID is permanently authorized. The bot creates the `AuthorizedChats` tab on first use, seeds the configured `AUTHORIZED_CHAT_ID`, and stores one chat ID per row below the `Chat ID` header in A1.
 
 The supplied `/check` smoke test has already been confirmed by the owner. It tests Telegram delivery, webhook execution, and basic Sheets access; it does not prove writes, Calendar access, GAS triggers, Render dispatch, or WhatsApp delivery.
 

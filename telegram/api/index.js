@@ -6,7 +6,6 @@ const {
   prepareZoomSend,
   sendTelegramMessage,
   answerCallbackQuery,
-  fetchPendingRows,
   fetchAllRows,
   groupPendingRows,
   callbackSignature,
@@ -15,6 +14,7 @@ const {
   indiaDateKey
 } = require('../lib/preview');
 const { getGoogleAuth } = require('../lib/googleAuth');
+const { ADMIN_USER_ID, normalizeChatId, listAuthorizedChatIds, addAuthorizedChatId, removeAuthorizedChatId, isAuthorizedChat } = require('../lib/chatAccess');
 
 // Configuration Constants
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
@@ -27,18 +27,16 @@ const crypto = require('crypto');
 const TELEGRAM_COMMANDS = [
   { command: 'start',    description: 'Open the bot help menu' },
   { command: 'help',     description: 'Show available commands and examples' },
-  { command: 'status',   description: 'System status and pending counts' },
   { command: 'preview',  description: 'Prepare tomorrow\'s WhatsApp messages' },
   { command: 'today',    description: 'List today\'s classes' },
   { command: 'tomorrow', description: 'List tomorrow\'s classes' },
-  { command: 'pending',  description: 'List all unsent classes (any date)' },
   { command: 'list',     description: 'Search the full schedule' },
-  { command: 'faculty',  description: 'List classes by faculty name' },
   { command: 'create',   description: 'Add a class to the schedule' },
   { command: 'update',   description: 'Update a schedule row' },
   { command: 'resend',   description: 'Reset a row for resending' },
   { command: 'undo',     description: 'Unmark a row as sent' },
-  { command: 'delete',   description: 'Delete a class and its linked event' }
+  { command: 'delete',   description: 'Delete a class and its linked event' },
+  { command: 'chat',     description: 'Manage authorized chats (administrator only)' }
 ];
 
 function getMissingConfiguration(env = process.env) {
@@ -474,11 +472,6 @@ function getSafeErrorDetails(error) {
   return status ? `${safeMessage} (code ${status})` : safeMessage;
 }
 
-function isAuthorized(chatId, userId) {
-  const strChatId = String(chatId);
-  const strUserId = String(userId || '');
-  return strChatId === String(AUTHORIZED_CHAT_ID) || strUserId === String(AUTHORIZED_CHAT_ID);
-}
 
 function isValidCronAuthorization(authorization, expectedSecret = process.env.CRON_SECRET) {
   if (typeof authorization !== 'string' || !expectedSecret) return false;
@@ -578,7 +571,9 @@ module.exports = async (req, res) => {
       const callbackQuery = payload.callback_query;
       const chatId = callbackQuery.message?.chat?.id;
       const userId = callbackQuery.from?.id;
-      if (!isAuthorized(chatId, userId)) {
+      if (!await isAuthorizedChat({
+        sheets: getSheetsClient(), spreadsheetId: SPREADSHEET_ID, chatId, userId, initialChatId: AUTHORIZED_CHAT_ID
+      })) {
         await answerCallbackQuery(callbackQuery.id, 'Access denied.');
         res.status(200).json({ ok: true });
         return;
@@ -597,12 +592,14 @@ module.exports = async (req, res) => {
       const chatId = message.chat.id;
       const userId = message.from ? message.from.id : null;
 
-      if (!isAuthorized(chatId, userId)) {
+      if (!await isAuthorizedChat({
+        sheets: getSheetsClient(), spreadsheetId: SPREADSHEET_ID, chatId, userId, initialChatId: AUTHORIZED_CHAT_ID
+      })) {
         await sendTelegramMessage(chatId, `🚫 *Access Denied.* Your Chat ID (\`${chatId}\`) is not authorized to interact with this bot.`);
         res.status(200).json({ ok: true });
         return;
       }
-      await handleTelegramCommand(chatId, text);
+      await handleTelegramCommand(chatId, text, { userId, chatType: message.chat?.type });
     }
 
     res.status(200).json({ ok: true });
@@ -612,7 +609,7 @@ module.exports = async (req, res) => {
   }
 };
 
-async function handleTelegramCommand(chatId, text) {
+async function handleTelegramCommand(chatId, text, context = {}) {
   const parts = text.split(/\s+/);
   const command = parts[0].toLowerCase();
   const argsStr = text.substring(parts[0].length).trim();
@@ -622,22 +619,20 @@ async function handleTelegramCommand(chatId, text) {
       `🤖 *TCR Class Scheduler Bot*\n\n` +
       `*Broadcast*\n` +
       `📌 */preview* — Prepare tomorrow's WhatsApp messages\n` +
-      `📌 */status* — System status and pending counts\n\n` +
       `*Schedule*\n` +
       `📌 */today* — List today's classes\n` +
       `📌 */tomorrow* — List tomorrow's classes\n` +
-      `📌 */pending* — All unsent classes (any date)\n` +
       `📌 */list* _[filter]_ — Search schedule\n` +
       `   e.g. \`/list 4 Oct\`, \`/list Laxmi Nagar\`, \`/list CLAT\`\n` +
-      `📌 */faculty* _Name_ — Classes by faculty\n` +
-      `   e.g. \`/faculty Shivam\`\n\n` +
       `*Edit*\n` +
       `📌 */create* _Details_ — Add a class (comma/pipe/newline format)\n` +
       `📌 */update* _Row Field Value_ — Update one field\n` +
       `   e.g. \`/update 15 Faculty Anand Sir\`\n` +
       `📌 */resend* _Row_ — Reset a row for resending\n` +
       `📌 */undo* _Row_ — Unmark SENT (keep Zoom link)\n` +
-      `📌 */delete* _Row_ — Delete row + linked Calendar event`;
+      `📌 */delete* _Row_ — Delete row + linked Calendar event\n\n` +
+      `*Administrator*\n` +
+      `📌 */chat add* _Chat ID_, */chat remove* _Chat ID_, */chat list* — Manage bot access (private chat only)`;
 
     try {
       await setTelegramCommandMenu();
@@ -652,13 +647,11 @@ async function handleTelegramCommand(chatId, text) {
   }
 
   try {
-    if (command === '/status')   { await handleStatusCommand(chatId); return; }
+    if (command === '/chat')     { await handleChatCommand(chatId, argsStr, context); return; }
     if (command === '/preview')  { await runPreview(chatId); return; }
     if (command === '/today')    { await handleDateCommand(chatId, 0); return; }
     if (command === '/tomorrow') { await handleDateCommand(chatId, 1); return; }
-    if (command === '/pending')  { await handlePendingCommand(chatId); return; }
     if (command === '/list')     { await handleListCommand(chatId, argsStr); return; }
-    if (command === '/faculty')  { await handleFacultyCommand(chatId, argsStr); return; }
     if (command === '/create' || command === '/add') { await handleCreateCommand(chatId, argsStr); return; }
     if (command === '/update')   { await handleUpdateCommand(chatId, argsStr); return; }
     if (command === '/resend')   { await handleResendCommand(chatId, argsStr); return; }
@@ -674,34 +667,28 @@ async function handleTelegramCommand(chatId, text) {
   }
 }
 
-// ---------- New command handlers ----------
-
-async function handleStatusCommand(chatId) {
-  const rows = await fetchAllRows();
-  const todayKey = indiaDateKey(0);
-  const tomorrowKey = indiaDateKey(1);
-
-  const pending = rows.filter(r => r.status !== 'SENT');
-  const todayRows = rows.filter(r => scheduleDateKey(r.date) === todayKey);
-  const tomorrowRows = rows.filter(r => scheduleDateKey(r.date) === tomorrowKey);
-  const prepared = pending.filter(r => r.zoomUrl);
-
-  const now = new Date().toLocaleString('en-IN', {
-    timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short'
-  });
-
-  const msg =
-    `🤖 *TCR Bot Status*\n\n` +
-    `🕐 IST now: *${now}*\n` +
-    `📊 Total rows: *${rows.length}*\n` +
-    `⏳ Pending (G ≠ SENT): *${pending.length}*\n` +
-    `🎥 Of those, Zoom prepared: *${prepared.length}*\n\n` +
-    `📅 Today (${formatScheduleDate(todayKey)}): *${todayRows.length}* class(es)\n` +
-    `📅 Tomorrow (${formatScheduleDate(tomorrowKey)}): *${tomorrowRows.length}* class(es)\n\n` +
-    `💡 Run /preview to prepare WhatsApp messages.`;
-
-  await sendTelegramMessage(chatId, msg);
+async function handleChatCommand(chatId, argsStr, { userId, chatType } = {}) {
+  if (String(userId || '') !== ADMIN_USER_ID) { await sendTelegramMessage(chatId, 'Only the administrator can manage authorized chats.'); return; }
+  if (chatType !== 'private' || String(chatId) !== ADMIN_USER_ID) { await sendTelegramMessage(chatId, 'Use /chat commands in the administrator’s private chat.'); return; }
+  const [action, chatIdArg, ...extra] = argsStr.split(/\s+/).filter(Boolean);
+  if (action === 'list' && !chatIdArg) {
+    const ids = await listAuthorizedChatIds({ sheets:getSheetsClient(), spreadsheetId:SPREADSHEET_ID, initialChatId:AUTHORIZED_CHAT_ID });
+    const visible = [...new Set([ADMIN_USER_ID,...ids])];
+    await sendTelegramMessage(chatId, `Authorized chat IDs:\n${visible.map(id=>`• \`${id}\``).join('\n')}`); return;
+  }
+  const target = normalizeChatId(chatIdArg);
+  if (!['add','remove'].includes(action) || !target || extra.length) { await sendTelegramMessage(chatId, 'Usage: /chat add <chat-id>, /chat remove <chat-id>, or /chat list'); return; }
+  if (target === ADMIN_USER_ID) { await sendTelegramMessage(chatId, 'The administrator is permanently authorized and cannot be changed.'); return; }
+  const options={sheets:getSheetsClient(),spreadsheetId:SPREADSHEET_ID,initialChatId:AUTHORIZED_CHAT_ID,chatId:target};
+  if (action==='add') {
+    const added=await addAuthorizedChatId(options);
+    await sendTelegramMessage(chatId, added ? `Chat \`${target}\` is now authorized.` : `Chat \`${target}\` is already authorized.`); return;
+  }
+  const removed=await removeAuthorizedChatId(options);
+  await sendTelegramMessage(chatId, removed ? `Chat \`${target}\` is no longer authorized.` : `Chat \`${target}\` was not authorized.`);
 }
+
+// ---------- Remaining command handlers ----------
 
 async function handleDateCommand(chatId, offsetDays) {
   const rows = await fetchAllRows();
@@ -709,23 +696,6 @@ async function handleDateCommand(chatId, offsetDays) {
   const filtered = rows.filter(r => scheduleDateKey(r.date) === target);
   const label = offsetDays === 0 ? 'Today' : 'Tomorrow';
   await sendRowList(chatId, `${label} · ${formatScheduleDate(target)}`, filtered);
-}
-
-async function handlePendingCommand(chatId) {
-  const rows = await fetchAllRows();
-  const pending = rows.filter(r => r.status !== 'SENT');
-  await sendRowList(chatId, 'Pending classes (G ≠ SENT)', pending);
-}
-
-async function handleFacultyCommand(chatId, nameFilter) {
-  if (!nameFilter) {
-    await sendTelegramMessage(chatId, `⚠️ *Usage:* \`/faculty Shivam\`\nShows all classes taught by the matching faculty name.`);
-    return;
-  }
-  const rows = await fetchAllRows();
-  const norm = nameFilter.trim().toLowerCase();
-  const filtered = rows.filter(r => r.faculty.toLowerCase().includes(norm));
-  await sendRowList(chatId, `Classes for "${nameFilter}"`, filtered);
 }
 
 async function sendRowList(chatId, title, rows) {
