@@ -165,6 +165,13 @@ function rowNeedsZoom(row) {
   return center === 'laxmi nagar' && !subject.includes('mock') && !subject.includes('test');
 }
 
+function centerCode(center) {
+  const normalizedCenter = String(center || '').trim().toLowerCase();
+  if (normalizedCenter === 'laxmi nagar') return 'LN';
+  if (normalizedCenter === 'hauz khas') return 'HK';
+  return '';
+}
+
 function hasAllZoomLinks(group) {
   return group.rows.every(row => !rowNeedsZoom(row) || /^https:\/\/\S+/i.test(String(row.zoomUrl || '').trim()));
 }
@@ -270,7 +277,7 @@ function formatScheduleDate(dateValue) {
 
 function formatGroupMessage(group) {
   const message = [
-    `*TCR – ${group.course.toUpperCase()} CLASS FLOW*`,
+    `*TCR – ${group.course.toUpperCase()} CLASS FLOW${centerCode(group.center) ? ` (${centerCode(group.center)})` : ''}*`,
     '',
     '*Class Schedule*',
     `📌 ${formatScheduleDate(group.date)}`,
@@ -282,7 +289,7 @@ function formatGroupMessage(group) {
       `Subject: *${row.subject}*`,
       `Faculty: *${row.faculty.toUpperCase()}*`
     );
-    if (row.zoomUrl) message.push(`🔗 *Zoom:* ${row.zoomUrl}`);
+    if (rowNeedsZoom(row) && row.zoomUrl) message.push(`🔗 *Zoom:* ${row.zoomUrl}`);
     else if (rowNeedsZoom(row)) message.push('🔗 *Zoom:* Link not prepared');
     message.push('');
   }
@@ -316,7 +323,7 @@ function buildKeyboard(group) {
 
 async function runPreview(chatId) {
   const rows = await fetchPendingRows();
-  await Promise.all(rows.filter(row => row.zoomUrl).map(syncZoomMeeting));
+  await Promise.all(rows.filter(row => rowNeedsZoom(row) && row.zoomUrl).map(syncZoomMeeting));
   const groups = groupPendingRows(rows);
   if (!groups.length) {
     await sendTelegramMessage(chatId, '📅 No upcoming pending or prepared classes were found.');
@@ -367,7 +374,7 @@ async function prepareZoomSend(rowIndices, chatId = AUTHORIZED_CHAT_ID) {
   const values = [];
   for (const row of rows) {
     if (row.zoomUrl) {
-      await syncZoomMeeting(row);
+      if (rowNeedsZoom(row)) await syncZoomMeeting(row);
       continue;
     }
     if (!rowNeedsZoom(row)) continue;

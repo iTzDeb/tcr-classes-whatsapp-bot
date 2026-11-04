@@ -144,7 +144,7 @@ const preparedGroup = groupPendingRows(previewRows)[0];
 assert.strictEqual(
   formatGroupMessage(preparedGroup),
   [
-    '*TCR – CLAT CLASS FLOW*',
+    '*TCR – CLAT CLASS FLOW (LN)*',
     '',
     '*Class Schedule*',
     '📌 6th September',
@@ -167,6 +167,15 @@ const preparedKeyboard = buildKeyboard(preparedGroup).inline_keyboard;
 assert.strictEqual(preparedKeyboard[0][0].text, '📤 Open WhatsApp');
 assert.ok(preparedKeyboard[0][0].url.startsWith('https://wa.me/?text='));
 assert.strictEqual(preparedKeyboard[1][0].text, '✅ Mark as sent');
+const hauzKhasGroup = groupPendingRows([{
+  rowIndex: 6, date: '06 Sept 2026', time: '4:00 - 6:00PM', center: 'Hauz Khas',
+  course: 'CLAT/CUET/CLAT 28', subject: 'Legal', faculty: 'Shivam Sir', status: '',
+  zoomUrl: 'https://zoom.us/j/987654321'
+}])[0];
+const hauzKhasMessage = formatGroupMessage(hauzKhasGroup);
+assert.ok(hauzKhasMessage.startsWith('*TCR – CLAT/CUET/CLAT 28 CLASS FLOW (HK)*'));
+assert.doesNotMatch(hauzKhasMessage, /Zoom/,
+  'Hauz Khas schedules must not show Zoom links, even if a stale link is stored in the sheet');
 previewRows.forEach(row => {
   row.status = 'SENT';
 });

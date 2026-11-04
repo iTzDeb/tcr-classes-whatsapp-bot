@@ -86,7 +86,7 @@ The Vercel Telegram app writes schedule rows directly through the Google Sheets 
 | --- | --- |
 | `/start`, `/help` | Show help. |
 | `/check` | Read the sheet and count rows with a date and status other than `SENT`. This confirms the bot responded and can read the schedule. |
-| `/preview` | Prepare only complete, unsent classes scheduled for tomorrow. Existing Zoom links are refreshed from the current sheet details before the preview is sent. |
+| `/preview` | Prepare only complete, unsent classes scheduled for tomorrow. Headings identify Laxmi Nagar as `(LN)` and Hauz Khas as `(HK)`; Zoom links are generated/refreshed only for eligible Laxmi Nagar classes. |
 | `/list` | Show schedule rows. |
 | `/list <date or text>` | Filter by a date, center, course, subject, faculty, or keyword. |
 | `/create <class details>` or `/add <class details>` | Add a complete row in chronological order using an explicit A:H range, leaving G empty and storing the Calendar `iCalUID` in H. The entered class date/time is interpreted as Asia/Kolkata (IST) for Calendar creation. |
