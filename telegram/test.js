@@ -30,7 +30,8 @@ const {
   callbackSignature,
   formatGroupMessage,
   formatScheduleDate,
-  buildKeyboard
+  buildKeyboard,
+  syncExistingZoomMeetings
 } = preview;
 
 console.log('Running search/filter, natural input & chronological sorting tests...');
@@ -92,6 +93,90 @@ async function testZoomMeetingSyncUsesCurrentSchedule() {
   }
 }
 
+async function testSyncExistingZoomMeetingsSyncsEveryStoredMeeting() {
+  const calls = [];
+  const env = {
+    ZOOM_ACCOUNT_ID: process.env.ZOOM_ACCOUNT_ID,
+    ZOOM_CLIENT_ID: process.env.ZOOM_CLIENT_ID,
+    ZOOM_CLIENT_SECRET: process.env.ZOOM_CLIENT_SECRET
+  };
+  process.env.ZOOM_ACCOUNT_ID = 'account';
+  process.env.ZOOM_CLIENT_ID = 'client';
+  process.env.ZOOM_CLIENT_SECRET = 'secret';
+  const fetchImpl = async (url, options) => {
+    calls.push({ url, options });
+    return url.includes('/oauth/token')
+      ? { ok: true, json: async () => ({ access_token: 'access-token' }) }
+      : { ok: true, json: async () => ({}) };
+  };
+  try {
+    await syncExistingZoomMeetings([
+      {
+        rowIndex: 7, date: '05 Nov 2026', time: '04:00PM - 06:00PM',
+        center: 'Laxmi Nagar', course: 'CLAT', subject: 'Legal', faculty: 'Shivam Sir',
+        zoomUrl: 'https://zoom.us/j/123456789'
+      },
+      {
+        rowIndex: 8, date: '05 Nov 2026', time: '06:00PM - 08:00PM',
+        center: 'Laxmi Nagar', course: 'CLAT', subject: 'English', faculty: 'Anand Sir',
+        zoomUrl: 'https://zoom.us/j/987654321'
+      }
+    ], fetchImpl);
+    assert.strictEqual(calls.length, 4, 'Both stored Zoom meetings should be updated through the injected fetch');
+    assert.deepStrictEqual(
+      calls.filter(call => call.options && call.options.method === 'PUT').map(call => call.url),
+      [
+        'https://api.zoom.us/v2/meetings/123456789',
+        'https://api.zoom.us/v2/meetings/987654321'
+      ],
+      'Each row must update its own stored Zoom meeting'
+    );
+  } finally {
+    for (const [name, value] of Object.entries(env)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
+
+async function testSyncExistingZoomMeetingsSkipsRowsWithoutPendingZoom() {
+  const calls = [];
+  const env = {
+    ZOOM_ACCOUNT_ID: process.env.ZOOM_ACCOUNT_ID,
+    ZOOM_CLIENT_ID: process.env.ZOOM_CLIENT_ID,
+    ZOOM_CLIENT_SECRET: process.env.ZOOM_CLIENT_SECRET
+  };
+  process.env.ZOOM_ACCOUNT_ID = 'account';
+  process.env.ZOOM_CLIENT_ID = 'client';
+  process.env.ZOOM_CLIENT_SECRET = 'secret';
+  const fetchImpl = async (url, options) => {
+    calls.push({ url, options });
+    return url.includes('/oauth/token')
+      ? { ok: true, json: async () => ({ access_token: 'access-token' }) }
+      : { ok: true, json: async () => ({}) };
+  };
+  try {
+    await syncExistingZoomMeetings([
+      {
+        rowIndex: 9, date: '05 Nov 2026', time: '04:00PM - 06:00PM',
+        center: 'Laxmi Nagar', course: 'CLAT', subject: 'Legal', faculty: 'Shivam Sir',
+        zoomUrl: ''
+      },
+      {
+        rowIndex: 10, date: '05 Nov 2026', time: '04:00PM - 06:00PM',
+        center: 'Hauz Khas', course: 'CLAT', subject: 'Legal', faculty: 'Shivam Sir',
+        zoomUrl: 'https://zoom.us/j/987654321'
+      }
+    ], fetchImpl);
+    assert.strictEqual(calls.length, 0, 'Rows without a Zoom need or without a stored link must not be synced');
+  } finally {
+    for (const [name, value] of Object.entries(env)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
+
 assert.deepStrictEqual(Object.keys(preview).sort(), [
   'answerCallbackQuery',
   'buildKeyboard',
@@ -107,7 +192,8 @@ assert.deepStrictEqual(Object.keys(preview).sort(), [
   'prepareZoomSend',
   'runPreview',
   'scheduleDateKey',
-  'sendTelegramMessage'
+  'sendTelegramMessage',
+  'syncExistingZoomMeetings'
 ]);
 
 const previewRows = [
@@ -620,6 +706,8 @@ Promise.all([
   testExplicitScheduleRowWrite(),
   testCalendarAndRowDeletion(),
   testZoomMeetingSyncUsesCurrentSchedule(),
+  testSyncExistingZoomMeetingsSyncsEveryStoredMeeting(),
+  testSyncExistingZoomMeetingsSkipsRowsWithoutPendingZoom(),
   testChatAccess()
 ])
   .then(() => console.log('All Telegram schedule bot tests passed successfully!'))

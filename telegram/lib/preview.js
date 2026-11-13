@@ -335,9 +335,14 @@ function buildKeyboard(group) {
   return { inline_keyboard: keyboard };
 }
 
+async function syncExistingZoomMeetings(rows, fetchImpl = fetch) {
+  const pending = rows.filter(row => rowNeedsZoom(row) && row.zoomUrl);
+  return Promise.all(pending.map(row => syncZoomMeeting(row, fetchImpl)));
+}
+
 async function runPreview(chatId) {
   const rows = await fetchPendingRows();
-  await Promise.all(rows.filter(row => rowNeedsZoom(row) && row.zoomUrl).map(syncZoomMeeting));
+  await syncExistingZoomMeetings(rows);
   const groups = groupPendingRows(rows);
   if (!groups.length) {
     await sendTelegramMessage(chatId, '📅 No upcoming pending or prepared classes were found.');
@@ -448,5 +453,6 @@ module.exports = {
   formatScheduleDate,
   scheduleDateKey,
   indiaDateKey,
-  buildKeyboard
+  buildKeyboard,
+  syncExistingZoomMeetings
 };
