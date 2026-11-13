@@ -337,19 +337,36 @@ function buildKeyboard(group) {
 
 async function syncExistingZoomMeetings(rows, fetchImpl = fetch) {
   const pending = rows.filter(row => rowNeedsZoom(row) && row.zoomUrl);
-  return Promise.all(pending.map(row => syncZoomMeeting(row, fetchImpl)));
+  const failures = [];
+  for (const row of pending) {
+    try {
+      await syncZoomMeeting(row, fetchImpl);
+    } catch (error) {
+      failures.push({ rowIndex: row.rowIndex, message: error.message });
+      console.error('Zoom refresh failed:', { rowIndex: row.rowIndex, message: error.message });
+    }
+  }
+  return failures;
+}
+
+function zoomWarning(rowIndices) {
+  if (!rowIndices.length) return '';
+  const list = rowIndices.join(', ');
+  return `\n\n⚠️ Zoom link refresh failed for row(s) ${list}. Run /resend ${rowIndices[0]} then /preview to regenerate the link.`;
 }
 
 async function runPreview(chatId) {
   const rows = await fetchPendingRows();
-  await syncExistingZoomMeetings(rows);
+  const failures = await syncExistingZoomMeetings(rows);
+  const failedRows = new Set(failures.map(failure => failure.rowIndex));
   const groups = groupPendingRows(rows);
   if (!groups.length) {
     await sendTelegramMessage(chatId, '📅 No upcoming pending or prepared classes were found.');
     return 0;
   }
   for (const group of groups) {
-    await sendTelegramMessage(chatId, formatGroupMessage(group), {
+    const warning = zoomWarning(group.rowIndices.filter(rowIndex => failedRows.has(rowIndex)));
+    await sendTelegramMessage(chatId, formatGroupMessage(group) + warning, {
       parse_mode: 'Markdown',
       reply_markup: buildKeyboard(group)
     });
@@ -392,9 +409,17 @@ async function prepareZoomSend(rowIndices, chatId) {
   if (!chatId) throw new Error('prepareZoomSend needs the chat that requested the preview.');
   const { sheets, sheet, rows } = await readRowsByIndex(rowIndices);
   const values = [];
+  const failedRows = [];
   for (const row of rows) {
     if (row.zoomUrl) {
-      if (rowNeedsZoom(row)) await syncZoomMeeting(row);
+      if (rowNeedsZoom(row)) {
+        try {
+          await syncZoomMeeting(row);
+        } catch (error) {
+          failedRows.push(row.rowIndex);
+          console.error('Zoom refresh failed:', { rowIndex: row.rowIndex, message: error.message });
+        }
+      }
       continue;
     }
     if (!rowNeedsZoom(row)) continue;
@@ -415,7 +440,7 @@ async function prepareZoomSend(rowIndices, chatId) {
     });
   }
   const group = groupPendingRows(rows)[0];
-  await sendTelegramMessage(chatId, formatGroupMessage(group), {
+  await sendTelegramMessage(chatId, formatGroupMessage(group) + zoomWarning(failedRows), {
     parse_mode: 'Markdown',
     reply_markup: buildKeyboard(group)
   });

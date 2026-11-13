@@ -173,9 +173,18 @@ async function syncZoomMeeting(row, fetchImpl = fetch) {
     signal: AbortSignal.timeout(10000),
     body: JSON.stringify(getZoomMeetingUpdate(row))
   });
-  const meetingBody = await meetingResponse.json();
+  const meetingBody = await meetingResponse.json().catch(() => ({}));
   if (!meetingResponse.ok) {
-    throw new Error(`Zoom meeting update failed for row ${row.rowIndex}: ${meetingBody.message || meetingResponse.status}`);
+    const details = [
+      `HTTP ${meetingResponse.status}`,
+      meetingBody.code ? `code ${meetingBody.code}` : null,
+      `meeting ${meetingId}`
+    ].filter(Boolean).join(', ');
+    const error = new Error(`Zoom meeting update failed for row ${row.rowIndex} (${details}): ${meetingBody.message || 'unknown error'}`);
+    error.zoomStatus = meetingResponse.status;
+    error.zoomCode = meetingBody.code;
+    error.rowIndex = row.rowIndex;
+    throw error;
   }
   return true;
 }
