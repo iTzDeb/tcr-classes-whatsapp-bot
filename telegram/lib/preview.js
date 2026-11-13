@@ -6,7 +6,6 @@ const { createZoomMeeting, syncZoomMeeting } = require('./zoom');
 
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const AUTHORIZED_CHAT_ID = process.env.AUTHORIZED_CHAT_ID;
 const DEFAULT_SHEET_TAB = 'Schedule';
 
 function telegramRequest(method, payload) {
@@ -166,9 +165,12 @@ function rowNeedsZoom(row) {
 }
 
 function centerCode(center) {
-  const normalizedCenter = String(center || '').trim().toLowerCase();
-  if (normalizedCenter === 'laxmi nagar') return 'LN';
-  if (normalizedCenter === 'hauz khas') return 'HK';
+  const normalizedCenter = String(center || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+(centre|center|campus)$/, '');
+  if (normalizedCenter === 'laxmi nagar' || normalizedCenter === 'ln') return 'LN';
+  if (normalizedCenter === 'hauz khas' || normalizedCenter === 'hk') return 'HK';
   return '';
 }
 
@@ -275,7 +277,7 @@ function formatScheduleDate(dateValue) {
   return `${day}${ordinalSuffix} ${month}`;
 }
 
-function formatGroupMessage(group) {
+function formatGroupMessage(group, { includeZoom = true } = {}) {
   const message = [
     `*TCR - ${group.course.toUpperCase()} CLASS FLOW${centerCode(group.center) ? ` (${centerCode(group.center)})` : ''}*`,
     '',
@@ -289,33 +291,45 @@ function formatGroupMessage(group) {
       `Subject: *${row.subject}*`,
       `Faculty: *${row.faculty.toUpperCase()}*`
     );
-    if (rowNeedsZoom(row) && row.zoomUrl) message.push(`🔗 *Zoom:* ${row.zoomUrl}`);
-    else if (rowNeedsZoom(row)) message.push('🔗 *Zoom:* Link not prepared');
+    if (includeZoom && rowNeedsZoom(row)) {
+      message.push(row.zoomUrl ? `🔗 *Zoom:* ${row.zoomUrl}` : '🔗 *Zoom:* Link not prepared');
+    }
     message.push('');
   }
   message.push('Regards,', '*TEAM TCR*');
   return message.join('\n');
 }
 
+function whatsappUrl(group, includeZoom) {
+  return `https://wa.me/?text=${encodeURIComponent(formatGroupMessage(group, { includeZoom }))}`;
+}
+
 function buildKeyboard(group) {
   const signature = callbackSignature(group);
   const firstRow = group.rowIndices[0];
+  const anyUnsent = group.rows.some(row => row.status !== 'SENT');
+  const needsZoom = group.rows.some(rowNeedsZoom);
+  const linksReady = hasAllZoomLinks(group);
+  const label = suffix => `${anyUnsent ? '📤 Open WhatsApp' : '📤 Send to WhatsApp'}${suffix}`;
   const keyboard = [];
-  if (hasAllZoomLinks(group)) {
-    keyboard.push([{
-      text: group.rows.some(row => row.status !== 'SENT') ? '📤 Open WhatsApp' : '📤 Send to WhatsApp',
-      url: `https://wa.me/?text=${encodeURIComponent(formatGroupMessage(group))}`
-    }]);
-    if (group.rows.some(row => row.status !== 'SENT')) {
-      keyboard.push([{
-        text: '✅ Mark as sent',
-        callback_data: `sent:${firstRow}:${signature}`
-      }]);
-    }
+
+  if (!needsZoom) {
+    keyboard.push([{ text: label(''), url: whatsappUrl(group, true) }]);
+  } else if (linksReady) {
+    keyboard.push([{ text: label(' (with Zoom)'), url: whatsappUrl(group, true) }]);
+    keyboard.push([{ text: label(' (no Zoom)'), url: whatsappUrl(group, false) }]);
   } else {
+    keyboard.push([{ text: label(' (no Zoom)'), url: whatsappUrl(group, false) }]);
     keyboard.push([{
       text: '🎥 Generate Zoom & Prepare Send',
       callback_data: `prepare:${firstRow}:${signature}`
+    }]);
+  }
+
+  if (linksReady && anyUnsent) {
+    keyboard.push([{
+      text: '✅ Mark as sent',
+      callback_data: `sent:${firstRow}:${signature}`
     }]);
   }
   return { inline_keyboard: keyboard };
@@ -369,7 +383,8 @@ async function readRowsByIndex(rowIndices) {
   return { sheets, sheet, rows: result };
 }
 
-async function prepareZoomSend(rowIndices, chatId = AUTHORIZED_CHAT_ID) {
+async function prepareZoomSend(rowIndices, chatId) {
+  if (!chatId) throw new Error('prepareZoomSend needs the chat that requested the preview.');
   const { sheets, sheet, rows } = await readRowsByIndex(rowIndices);
   const values = [];
   for (const row of rows) {

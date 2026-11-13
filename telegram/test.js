@@ -133,9 +133,17 @@ assert.strictEqual(formatZoomStartTime('06 Sept 2026', '04:00 - 05:00PM'), '2026
 assert.strictEqual(previewGroups.length, 1, 'Classes for the same date, center, and course should group together');
 assert.deepStrictEqual(previewGroups[0].rowIndices, [4, 5]);
 assert.match(formatGroupMessage(previewGroups[0]), /\*Zoom:\* Link not prepared/);
+const pendingKeyboard = buildKeyboard(previewGroups[0]).inline_keyboard;
+assert.strictEqual(pendingKeyboard[0][0].text, '📤 Open WhatsApp (no Zoom)');
+assert.strictEqual(pendingKeyboard[1][0].text, '🎥 Generate Zoom & Prepare Send');
+const noZoomMessage = formatGroupMessage(previewGroups[0], { includeZoom: false });
+assert.doesNotMatch(noZoomMessage, /Zoom/,
+  'The no-Zoom variant must not contain a Zoom line or placeholder');
+assert.ok(noZoomMessage.startsWith('*TCR - CLAT CLASS FLOW (LN)*'));
 assert.strictEqual(
-  buildKeyboard(previewGroups[0]).inline_keyboard[0][0].text,
-  '🎥 Generate Zoom & Prepare Send'
+  decodeURIComponent(pendingKeyboard[0][0].url.split('text=')[1]),
+  noZoomMessage,
+  'The no-Zoom WhatsApp button must carry the formatted message without Zoom'
 );
 previewRows.forEach(row => {
   row.zoomUrl = `https://zoom.us/j/${row.rowIndex}`;
@@ -164,9 +172,12 @@ assert.strictEqual(
   ].join('\n')
 );
 const preparedKeyboard = buildKeyboard(preparedGroup).inline_keyboard;
-assert.strictEqual(preparedKeyboard[0][0].text, '📤 Open WhatsApp');
+assert.strictEqual(preparedKeyboard[0][0].text, '📤 Open WhatsApp (with Zoom)');
 assert.ok(preparedKeyboard[0][0].url.startsWith('https://wa.me/?text='));
-assert.strictEqual(preparedKeyboard[1][0].text, '✅ Mark as sent');
+assert.match(decodeURIComponent(preparedKeyboard[0][0].url.split('text=')[1]), /\*Zoom:\* https:\/\/zoom\.us/);
+assert.strictEqual(preparedKeyboard[1][0].text, '📤 Open WhatsApp (no Zoom)');
+assert.doesNotMatch(decodeURIComponent(preparedKeyboard[1][0].url.split('text=')[1]), /Zoom/);
+assert.strictEqual(preparedKeyboard[2][0].text, '✅ Mark as sent');
 const hauzKhasGroup = groupPendingRows([{
   rowIndex: 6, date: '06 Sept 2026', time: '4:00 - 6:00PM', center: 'Hauz Khas',
   course: 'CLAT/CUET/CLAT 28', subject: 'Legal', faculty: 'Shivam Sir', status: '',
@@ -180,8 +191,22 @@ previewRows.forEach(row => {
   row.status = 'SENT';
 });
 const sentKeyboard = buildKeyboard(groupPendingRows(previewRows)[0]).inline_keyboard;
-assert.strictEqual(sentKeyboard[0][0].text, '📤 Send to WhatsApp');
-assert.strictEqual(sentKeyboard.length, 1, 'Already-sent rows should remain resendable without another mark action');
+assert.strictEqual(sentKeyboard[0][0].text, '📤 Send to WhatsApp (with Zoom)');
+assert.strictEqual(sentKeyboard[1][0].text, '📤 Send to WhatsApp (no Zoom)');
+assert.strictEqual(sentKeyboard.length, 2, 'Already-sent rows should remain resendable without another mark action');
+
+const laxmiAlias = groupPendingRows([{
+  rowIndex: 20, date: '06 Sept 2026', time: '4:00 - 6:00PM', center: 'Laxmi Nagar Centre',
+  course: 'CLAT', subject: 'Legal', faculty: 'Shivam Sir', status: '', zoomUrl: ''
+}])[0];
+assert.ok(formatGroupMessage(laxmiAlias).startsWith('*TCR - CLAT CLASS FLOW (LN)*'),
+  'Center aliases with a trailing "Centre" must still be tagged LN');
+const hauzKhasAlias = groupPendingRows([{
+  rowIndex: 21, date: '06 Sept 2026', time: '4:00 - 6:00PM', center: 'hauz khas center',
+  course: 'CLAT/CUET', subject: 'Legal', faculty: 'Shivam Sir', status: '', zoomUrl: ''
+}])[0];
+assert.ok(formatGroupMessage(hauzKhasAlias).startsWith('*TCR - CLAT/CUET CLASS FLOW (HK)*'),
+  'Hauz Khas Center (any case/spelling) must be tagged HK');
 assert.strictEqual(isValidCronAuthorization('Bearer cron-secret', 'cron-secret'), true);
 assert.strictEqual(isValidCronAuthorization('Bearer wrong-secret', 'cron-secret'), false);
 

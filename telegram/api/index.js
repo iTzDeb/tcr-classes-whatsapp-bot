@@ -510,7 +510,7 @@ async function handlePreviewCallback(callbackQuery) {
   const originalMessageId = callbackQuery.message?.message_id;
 
   if (match[1] === 'prepare') {
-    await prepareZoomSend(group.rowIndices);
+    await prepareZoomSend(group.rowIndices, chatId);
     await answerCallbackQuery(callbackQuery.id, 'Zoom links prepared. The WhatsApp message is ready.');
     return;
   }
