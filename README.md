@@ -25,7 +25,7 @@ flowchart LR
 | Component | Source | Runtime / deploy root | Responsibility |
 | --- | --- | --- | --- |
 | WhatsApp dispatcher | Separately maintained; source is not included in this repository | Render web service, configured in its owning project | Keeps a Baileys WhatsApp Web connection open, fetches pending schedule rows through GAS, creates Zoom links when configured, sends schedule bundles to mapped WhatsApp groups, then posts row acknowledgements to GAS. |
-| Telegram schedule manager | This repository, `telegram/` | Vercel project `tcr-telegram-scheduler-bot`, root directory `telegram`, production branch `main` | Authorized admin commands to check, list, create, update, and delete schedule rows. `/create` may also create a Calendar event. This is not the WhatsApp group dispatcher. |
+| Telegram schedule manager | This repository, `telegram/` | Vercel project `tcr-telegram-scheduler-bot`, root directory `telegram`, production branch `main` | Authorized admin commands to browse, create, update, reset, and delete schedule rows; `/preview` builds the WhatsApp-ready class message and generates/refreshes Zoom links for eligible Laxmi Nagar classes. `/create` may also create a Calendar event. A daily Vercel cron sends the preview automatically. This is not the WhatsApp group dispatcher. |
 | Google Apps Script | Externally managed project; §10 is a documentation template | Google Apps Script Web App plus manually installed/time-driven triggers | Exposes pending rows and WhatsApp group settings to the Render bot, marks acknowledged rows `SENT`, syncs calendar events, triggers dispatch, and sends operational Telegram alerts. |
 | Schedule data | Google spreadsheet | Google Sheets | Shared data contract for the three components. |
 | Optional Zoom integration | Zoom Server-to-Server OAuth app | Called by Render bot | Creates meeting links for configured centers. |
@@ -35,7 +35,7 @@ flowchart LR
 Avoid saying that every component “sends schedule announcements”; they do different jobs:
 
 * **WhatsApp group schedule announcements:** the separately maintained Render daemon (not included in this repository) sends the scheduled class bundle to WhatsApp groups. As described by this runbook, it selects rows that GAS returns as not `SENT`, groups them by center/course, and sends them to the group JIDs in the spreadsheet’s `Settings` tab.
-* **Telegram schedule-management bot:** the Vercel app sends command replies to the administrator who invoked `/check`, `/list`, `/create`, `/update`, `/delete`, or `/reauth`. It does **not** broadcast class schedules to Telegram groups/channels.
+* **Telegram schedule-management bot:** the Vercel app replies to the authorized chat that invoked `/help`, `/today`, `/tomorrow`, `/list`, `/preview`, `/create`, `/update`, `/resend`, `/undo`, `/delete`, or `/chat`. `/preview` (and the daily cron) render the class message as WhatsApp-ready text and offer a `wa.me` link the operator taps to open WhatsApp; the bot itself does **not** post to WhatsApp groups, and it does **not** broadcast to Telegram groups/channels. There is no `/check` or `/reauth` command in the checked-in app.
 * **Google Apps Script (GAS) template in §10:** describes calendar synchronization, calls Render `/dispatch`, marks rows `SENT` after Render’s callback, and sends operational Telegram alerts. Its `/check` handler replies to the Telegram chat that sent the command. The template does **not** broadcast schedule announcements to Telegram channels.
 
 Thus, according to the documented behavior, the two bots are not both announcing the same class to Telegram audiences. The important shared-state hazard is **Column G (`SENT`)**: Render considers a row complete after a successful send to *at least one* target group. If a class routes to multiple groups and one send fails while another succeeds, the bot still acknowledges all bundled rows to GAS; GAS marks them `SENT`, and the failed group will not get an automatic retry. A later operator edit can clear the status and requeue the row, but may resend it to groups that already received it. Before changing dispatch semantics, consider replacing the single global status with per-destination delivery tracking and idempotency; that is a behavior change and is not implemented here.
@@ -84,25 +84,27 @@ The Vercel Telegram app writes schedule rows directly through the Google Sheets 
 
 | Command | Effect |
 | --- | --- |
-| `/start`, `/help` | Show help. |
-| `/check` | Read the sheet and count rows with a date and status other than `SENT`. This confirms the bot responded and can read the schedule. |
-| `/preview` | Prepare only complete, unsent classes scheduled for tomorrow. Headings identify Laxmi Nagar as `(LN)` and Hauz Khas as `(HK)`; Zoom links are generated/refreshed only for eligible Laxmi Nagar classes. |
+| `/start`, `/help` | Show help and refresh the Telegram command menu and menu button. |
+| `/today` | List today's classes (Asia/Kolkata date). |
+| `/tomorrow` | List tomorrow's classes. |
 | `/list` | Show schedule rows. |
-| `/list <date or text>` | Filter by a date, center, course, subject, faculty, or keyword. |
+| `/list <date or text>` | Filter by a date, center, course, subject, faculty, or keyword. Month names may be spelled out (`/list 4 October`, `/list October`). |
+| `/preview` | Prepare only complete, unsent classes scheduled for **tomorrow**. Headings identify Laxmi Nagar as `(LN)` and Hauz Khas as `(HK)`; Zoom links are generated/refreshed only for eligible Laxmi Nagar classes. One message is sent per date/center/course group with inline buttons: `📤 Open WhatsApp` (opens a `wa.me` link pre-filled with the message), `✅ Mark as sent` (when Zoom links are ready and a row is not yet sent), or `🎥 Generate Zoom & Prepare Send` (when a Zoom link is still missing). Button callbacks are signed; a preview whose rows changed since sending is rejected as out of date. |
 | `/create <class details>` or `/add <class details>` | Add a complete row in chronological order using an explicit A:H range, leaving G empty and storing the Calendar `iCalUID` in H. The entered class date/time is interpreted as Asia/Kolkata (IST) for Calendar creation. |
-| `/update <row> <field> <value>` | Update one field. Supported fields: Date, Time, Center, Course, Subject, Faculty, Status. Changing a detail field clears G for redispatch. |
-| `/update <row> <full row>` | Update A–G for a complete class. It clears G and leaves H untouched. Review calendar consistency after changing class date/time/details. |
+| `/update <row> <field> <value>` | Update one field. Supported fields: Date, Time, Center, Course, Subject, Faculty, Status. Changing a detail field clears G and the stored Zoom URL in I. |
+| `/update <row> <full row>` | Update A–G for a complete class. It clears G and I and leaves H untouched. Review calendar consistency after changing class date/time/details. |
+| `/resend <row>` | Clear G (status) and I (Zoom URL) so the row can be re-prepared by `/preview`. |
+| `/undo <row>` | Clear `SENT` in G but keep the Zoom URL in I. |
 | `/delete <row>` | Delete the linked Calendar event in H, then permanently delete the schedule row. If Calendar deletion fails, the row is kept. If H is empty or the event is already gone, the bot reports that and deletes the row. |
-| `/chat add <chat-id>`, `/chat remove <chat-id>`, `/chat list` | Manage authorized chats in the administrator’s private Telegram chat only. IDs are stored in the spreadsheet’s `AuthorizedChats` tab. |
-| `/reauth` | Ask the Render daemon to start WhatsApp re-authentication when disconnected. If already connected, it reports that status without logging out the active session. |
+| `/chat add <chat-id>`, `/chat remove <chat-id>`, `/chat list` | Manage authorized chats in the administrator’s private Telegram chat only. IDs are stored in the spreadsheet's `AuthorizedChats` tab. |
 
-The `/chat` administrator is Telegram user ID `499900380`; the ID is permanently authorized. The bot creates the `AuthorizedChats` tab on first use, seeds the configured `AUTHORIZED_CHAT_ID`, and stores one chat ID per row below the `Chat ID` header in A1.
+Every command is refused for an unauthorized chat. The administrator's Telegram user ID is hard-coded in `telegram/lib/chatAccess.js` (`499900380`); it is permanently authorized. The bot creates the `AuthorizedChats` tab on first use, seeds the configured `AUTHORIZED_CHAT_ID` into it, and stores one chat ID per row below the `Chat ID` header in A1. Group chat IDs (negative) are accepted. Command failures reply with a short safe summary and a random reference ID that matches the Vercel function log entry.
 
-The supplied `/check` smoke test has already been confirmed by the owner. It tests Telegram delivery, webhook execution, and basic Sheets access; it does not prove writes, Calendar access, GAS triggers, Render dispatch, or WhatsApp delivery.
+The `/check` smoke test described in earlier revisions no longer exists: the command was never carried into the checked-in `telegram/` app. Use `/start` or `/list` as the read-only smoke test. Those confirm Telegram delivery, webhook execution, and basic Sheets access; they do not prove writes, Calendar access, GAS triggers, Render dispatch, or WhatsApp delivery.
 
-The Telegram `/start` and `/help` commands also register the Telegram command menu, including `/help`, using Bot API `setMyCommands`. Command failures are reported in the chat with a safe error summary and a reference ID for matching Vercel function logs. If Calendar creation fails during `/create`, the bot clearly reports that the schedule row was saved without an event. Calendar/Sheets failures during `/delete` stop the deletion when the event could not be removed, to avoid leaving an orphaned event.
+The Telegram `/start` and `/help` commands also register the Telegram command menu, including `/help`, using Bot API `setMyCommands` and `setChatMenuButton`. Command failures are reported in the chat with a safe error summary and a reference ID for matching Vercel function logs. If Calendar creation fails during `/create`, the bot clearly reports that the schedule row was saved without an event. Calendar/Sheets failures during `/delete` stop the deletion when the event could not be removed, to avoid leaving an orphaned event.
 
-`/reauth` calls the authenticated Render endpoint. A successful start means the daemon began a fresh pairing attempt; scan the newest QR image delivered to this chat. The bot sends a Telegram confirmation when pairing succeeds and an alert if the two-minute scan window expires. An already connected daemon is left untouched.
+`/preview` is also triggered by the daily Vercel cron (`GET /api/cron`, 10:58 UTC / 16:28 IST by default in `telegram/vercel.json`), which authenticates with `Authorization: Bearer <CRON_SECRET>` and sends its output to `AUTHORIZED_CHAT_ID`. The checked-in app has **no** `/reauth` command and reads no `RENDER_*` environment variables; WhatsApp relinking is done against the Render service directly (see §7).
 
 **Important:** deleting a row directly in Google Sheets does not call the Telegram bot and cannot automatically remove its Calendar event. Use Telegram `/delete <row>` for linked cleanup. Before deleting a row, check that its row number is current and that H contains the intended event identifier.
 
@@ -126,12 +128,16 @@ Set values in **Vercel Project → Settings → Environment Variables**, not in 
 | --- | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | Yes | Current token from Telegram BotFather. |
 | `TELEGRAM_WEBHOOK_SECRET` | Yes | Random 1–256 character secret consisting of letters, numbers, `_`, or `-`. Telegram sends it in `X-Telegram-Bot-Api-Secret-Token`. The code uses a timing-safe comparison. |
-| `AUTHORIZED_CHAT_ID` | Yes | User or chat ID authorized to issue commands. For least privilege, use the administrator’s private-chat user ID. |
+| `AUTHORIZED_CHAT_ID` | Yes | Initial authorized chat (seeded into `AuthorizedChats` when that tab is created) and recipient for the daily cron preview. For least privilege, use the administrator's private-chat user ID. |
 | `SPREADSHEET_ID` | Yes | Google spreadsheet ID. |
 | `GOOGLE_SERVICE_ACCOUNT_KEY` | Yes | Service account JSON, raw or base64-encoded. Keep it secret. |
 | `GOOGLE_CALENDAR_ID` | No | Calendar ID; code defaults to `primary`. Configure if the service account can write to that calendar. |
-| `RENDER_REAUTH_URL` | Required for `/reauth` | HTTPS URL of the Render daemon’s `/reauth` endpoint, e.g. `https://<render-service>.onrender.com/reauth`. |
-| `RENDER_REAUTH_TOKEN` | Required for `/reauth` | Bearer token shared with Render’s `RENDER_REAUTH_TOKEN`. Store only in Vercel/Render secret settings. |
+| `CRON_SECRET` | Yes | Bearer token Vercel's cron sends to `GET /api/cron`. Without it the cron endpoint returns 500. |
+| `ZOOM_ACCOUNT_ID` | Yes for Zoom links | Zoom Server-to-Server OAuth account ID. Without Zoom configuration, `/preview` cannot generate links for Laxmi Nagar classes. |
+| `ZOOM_CLIENT_ID` | Yes for Zoom links | Zoom Server-to-Server OAuth client ID. |
+| `ZOOM_CLIENT_SECRET` | Yes for Zoom links | Zoom Server-to-Server OAuth client secret. |
+
+A webhook POST is rejected with HTTP 500 and `missingEnvironmentVariables` unless all five of `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `AUTHORIZED_CHAT_ID`, `SPREADSHEET_ID`, and `GOOGLE_SERVICE_ACCOUNT_KEY` are non-empty. `ZOOM_*` and `CRON_SECRET` are not part of that check, so a missing Zoom secret fails at `/preview` time, and a missing `CRON_SECRET` fails only the cron endpoint.
 
 The code rejects POST requests with missing configuration or an invalid Telegram secret. The production endpoint must be reachable by Telegram. If Vercel Deployment Protection is enabled for the webhook URL, use Vercel’s documented automation-bypass mechanism and include the bypass query parameter in Telegram’s configured webhook URL; **do not paste the bypass secret into this README or a public issue**. The Telegram-specific secret check remains required even when Vercel protection is configured.
 
@@ -148,7 +154,7 @@ The code rejects POST requests with missing configuration or an invalid Telegram
    The `.` is intentional: with project root configured as `telegram`, deploying from within `telegram/` may make the CLI look for a nested `telegram/telegram` root. Verify the Vercel CLI message says the project’s configured root exists and the build routes `api/index.js`.
 4. Wait until the deployment status is **Ready**. Confirm production alias is `https://tcr-telegram-scheduler-bot.vercel.app/`.
 5. Check `GET /` for the health message; check Telegram `getWebhookInfo` for the expected webhook URL, zero/declining pending updates, and no `last_error_message`.
-6. Test `/check` and `/list` in the authorized private chat. For writes, use a copied spreadsheet and a non-production test deployment where possible.
+6. Test `/start` and `/list` in the authorized private chat. For writes, use a copied spreadsheet and a non-production test deployment where possible.
 
 From the Telegram app directory, local checks are:
 
@@ -171,10 +177,12 @@ JSON body:
 {
   "url": "https://tcr-telegram-scheduler-bot.vercel.app/",
   "secret_token": "<TELEGRAM_WEBHOOK_SECRET>",
-  "allowed_updates": ["message"],
+  "allowed_updates": ["message", "callback_query"],
   "drop_pending_updates": false
 }
 ```
+
+`callback_query` must be included: the `/preview` inline buttons (`Mark as sent`, `Generate Zoom & Prepare Send`) arrive as callback queries. Registering only `message` leaves the buttons visible but silently non-functional. Omit `allowed_updates` entirely to receive every update type.
 
 Inspect status using `getWebhookInfo` for the same bot token. If a token is rotated, update Vercel Production (and Preview if used), redeploy, then re-register the webhook. If the endpoint URL or Vercel protection configuration changes, update `setWebhook` and verify delivery again. Do not call `deleteWebhook` or set `drop_pending_updates: true` unless you deliberately intend to discard queued updates.
 
@@ -204,7 +212,7 @@ GAS runs under the Google account that owns/deploys the script, not the Vercel s
 | `ZOOM_CLIENT_SECRET` | Optional | Zoom OAuth client secret. |
 | `TELEGRAM_BOT_TOKEN` | Optional for alerts | Used for alerts and QR delivery from the Render bot. |
 | `TELEGRAM_CHAT_ID` | Optional for alerts | Recipient for Render alerts and login QR. |
-| `RENDER_REAUTH_TOKEN` | Required for `/reauth` | High-entropy bearer token. Must exactly match Vercel’s `RENDER_REAUTH_TOKEN`; never commit or put it in a URL. |
+| `RENDER_REAUTH_TOKEN` | Required for `POST /reauth` | High-entropy bearer token required by the daemon's `/reauth` endpoint. The checked-in Telegram app does not call this endpoint and does not read a matching Vercel variable. Never commit it or put it in a URL. |
 
 Configure the deployed Apps Script Web App `/exec` URL in the separately maintained Render daemon. That daemon’s source, including its `index.js`, is not included in this repository. The Render host URL is also referenced by the GAS trigger and keep-alive functions; update both GAS properties/settings when the Render service hostname changes. Never commit a new Apps Script URL if your deployment treats it as an access secret.
 
@@ -230,15 +238,15 @@ The Render daemon described below is maintained outside this repository; there i
 
 A response `200` from `/dispatch` means accepted/started; `503` means the WhatsApp socket is unavailable; `429` means another dispatch is already running. Review service logs and actual destination groups for delivery confirmation.
 
-`POST /reauth` returns `200` if already connected, `202` when pairing starts or is already in progress, `401` for an invalid bearer token, `409` when dispatch is active, and `503` if the endpoint token is not configured. A dispatch request made while WhatsApp is disconnected returns `503` and starts re-authentication automatically. The QR image is generated locally and uploaded to Telegram; QR contents are not sent to an external QR-rendering service. Each QR update is delivered, so scan the latest image. After a successful scan, Telegram confirms the link; if no scan completes within two minutes, the attempt stops and Telegram explains how to retry with `/reauth`.
+`POST /reauth` returns `200` if already connected, `202` when pairing starts or is already in progress, `401` for an invalid bearer token, `409` when dispatch is active, and `503` if the endpoint token is not configured. A dispatch request made while WhatsApp is disconnected returns `503` and starts re-authentication automatically. The QR image is generated locally and uploaded to Telegram; QR contents are not sent to an external QR-rendering service. Each QR update is delivered, so scan the latest image. After a successful scan, Telegram confirms the link; if no scan completes within two minutes, the attempt stops and Telegram explains how to retry.
 
 The GitHub Actions dispatcher prints the immediate HTTP status and response body and fails the run for non-`200` responses. A `200` confirms only that Render accepted the request; schedule fetching and WhatsApp sends run asynchronously, so check Render logs and Telegram alerts for their result. On an Apps Script fetch failure, the daemon logs the request URL, status/code, response details, timestamp, and error reference; the generic HTTP error alone does not identify the cause.
 
 ### WhatsApp relink / recovery
 
 1. Inspect Render logs and `GET /status`. Confirm whether the connection is logged out or merely reconnecting.
-2. In the authorized Telegram chat, send `/reauth`. The Vercel deployment must have `RENDER_REAUTH_URL` and `RENDER_REAUTH_TOKEN`; Render must have the matching `RENDER_REAUTH_TOKEN` and Telegram alert settings.
-3. Scan the newest QR photo in WhatsApp → **Settings → Linked Devices → Link a Device**. Pairing succeeds when the daemon reports connected and Telegram confirms it. The scan window is two minutes from the first QR; if it expires, send `/reauth` again.
+2. From a trusted machine, call the Render daemon's authenticated endpoint directly: `POST <render-service>/reauth` with `Authorization: Bearer <RENDER_REAUTH_TOKEN>`. The Vercel Telegram app no longer proxies this call, so there is no `/reauth` bot command; keep the token in a password manager or environment variable rather than shell history.
+3. Scan the newest QR photo in WhatsApp → **Settings → Linked Devices → Link a Device**. Pairing succeeds when the daemon reports connected and Telegram confirms it. The scan window is two minutes from the first QR; if it expires, call `/reauth` again.
 4. A dispatch request while disconnected automatically starts the same re-authentication flow and returns HTTP 503 to the caller; wait for the QR/link confirmation before retrying dispatch.
 5. If the endpoint returns 401, compare the Vercel and Render token values without sharing either. If it returns 503, check the Render token setting and redeploy. If no QR photo arrives, inspect Render logs for QR generation or Telegram upload errors and confirm `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
 6. Do not copy `auth_info/` into Git, send it through chat, or share it with a new operator. The authenticated `/reauth` action intentionally deletes this directory to clear stale pairing credentials and start a new link.
@@ -293,8 +301,10 @@ Create/manage triggers in Apps Script → **Triggers** (alarm-clock icon). Use o
 | Symptom | Checks |
 | --- | --- |
 | Telegram bot does not respond | Vercel production deployment is Ready; project root is `telegram`; `GET /` returns health; Telegram `getWebhookInfo` URL matches stable domain and has no delivery error; `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `AUTHORIZED_CHAT_ID` are correct; webhook secret sent by Telegram matches Vercel. Review Vercel function logs. |
-| Telegram says access denied | Confirm `AUTHORIZED_CHAT_ID` matches the expected Telegram private chat or user ID. Avoid using a group ID unless group access is intentional. |
-| `/check` works but schedule is empty | Confirm `SPREADSHEET_ID`, tab name `Schedule`, row 1 headers, rows have dates in A, and service account has Editor access. `/check` counts only dated rows not marked `SENT`. |
+| Telegram says access denied | Check `/chat list` from the administrator's private chat: the current chat ID must be listed, or send `/chat add <chat-id>` from the administrator account. Also confirm `AUTHORIZED_CHAT_ID` is correct; it only seeds the list when the `AuthorizedChats` tab is first created. |
+| `/list` works but schedule is empty | Confirm `SPREADSHEET_ID`, tab name `Schedule`, row 1 headers, rows have dates in A, and service account has Editor access. `/list` shows every dated row; `/preview` only shows complete, unsent rows dated tomorrow in Asia/Kolkata. |
+| `/preview` fails or shows no Zoom button | Check `ZOOM_ACCOUNT_ID`, `ZOOM_CLIENT_ID`, and `ZOOM_CLIENT_SECRET` in Vercel, Zoom Server-to-Server OAuth scope, and that the row's center is exactly `Laxmi Nagar` with a parsable time range (`4:00 - 6:00PM`). A single unparsable row aborts the whole preview, so check the Vercel log reference ID. |
+| `/preview` buttons do nothing | Confirm the Telegram webhook was registered with `allowed_updates` including `callback_query`; then re-run `/preview` because old button signatures are rejected after any row change. |
 | Telegram `/create` fails | Confirm full six fields (date, time, center, course, subject, faculty), Sheets API is enabled, service account has sheet Editor access, and chronological date/time formats are parseable. Test in a copy. |
 | Telegram `/create` row exists but Calendar event is missing | Check Vercel logs, `GOOGLE_CALENDAR_ID`, Calendar API enablement, service-account calendar sharing, and event-ID format in H. The handler can still create the row when Calendar sync returns no event. |
 | New Telegram row starts in column H or later | Update/redeploy the Telegram app with the explicit row insert/write fix. For an existing shifted row, use the repair procedure above; the code fix does not move old cells. |
@@ -304,8 +314,8 @@ Create/manage triggers in Apps Script → **Triggers** (alarm-clock icon). Use o
 | Render reports an Apps Script 404 | Check the `APPS_SCRIPT_URL` printed in Render logs, confirm it is the deployed Web App `/exec` URL (not `/dev`), and inspect the response details and active Apps Script deployment. |
 | Render `/dispatch` returns 503 | Check Render is running and `/status` says `whatsappConnected: true`; inspect Baileys reconnect/auth logs and relink if logged out. |
 | Render `/dispatch` returns 429 | A prior dispatch is still processing. Wait and inspect logs before retrying; do not start another send in parallel. |
-| Telegram `/reauth` reports it is not configured | Set `RENDER_REAUTH_URL` and `RENDER_REAUTH_TOKEN` in Vercel, and set the same token in Render. Redeploy both services after setting the variables. |
-| Telegram `/reauth` receives 401 or 503 | 401 means Vercel and Render bearer tokens differ; 503 means Render’s token is unset. Check secret names/values in provider settings without copying them into logs or chat. |
+| WhatsApp relink needed | The checked-in Telegram app has no `/reauth` command. Call the Render service's authenticated `POST /reauth` directly (see §7), or let a dispatch attempt trigger re-authentication. |
+| Render `/reauth` returns 401 or 503 | 401 means the bearer token in the request differs from Render's `RENDER_REAUTH_TOKEN`; 503 means Render's token is unset. Check secret names/values in provider settings without copying them into logs or chat. |
 | `/reauth` succeeds but no QR arrives | Check Render logs for the fresh pairing attempt and Telegram QR upload failure. Confirm Render has valid Telegram bot credentials and a reachable authorized `TELEGRAM_CHAT_ID`. |
 | A group did not receive a message but row says SENT | Current acknowledgement is row-wide: one successful recipient can cause all session rows to be marked `SENT`, even if another recipient failed. Check logs/group JIDs and manually coordinate a targeted resend to avoid duplicating groups already served. |
 | GAS Calendar sync does not run after Telegram edit | Expected: Sheets API edits do not invoke Apps Script `onEdit`; use a deliberate time-driven sync/reconciliation. |
@@ -761,7 +771,7 @@ function keepBotAlive() {
 
 1. Duplicate the Google spreadsheet and use a test calendar.
 2. Create a test Telegram/Vercel environment with a separate authorized chat, bot token, webhook secret, and copied sheet ID. Do not aim production commands at the copy unless Vercel env and webhook are explicitly set to test values.
-3. Confirm `/check` and `/list` return the expected rows.
+3. Confirm `/start` and `/list` return the expected rows.
 4. Test `/create` with a future test class; verify row placement, G is blank, H is populated only if calendar creation succeeds, and the test event is correct.
 5. Test `/update` on the test row; verify G is cleared and inspect whether its Calendar event was updated (the current Telegram handler does not sync calendar on updates).
 6. Test `/delete` only on the test row; verify the row is deleted and remove any associated test Calendar event.
@@ -807,6 +817,10 @@ These are operationally useful but change runtime behavior and should be reviewe
 * Standardize Calendar ID format between the Telegram Google API client and GAS `CalendarApp`; implement explicit update/delete behavior for Telegram-edited rows.
 * Replace the one-shot hard-coded `armDailyTrigger()` with an explicit recurring schedule and configurable time/timezone.
 * Add a test-only dispatch mode and end-to-end monitoring that does not send to real groups.
+* Make `/preview` tolerate one bad row: a single row whose time range cannot be parsed currently aborts the whole preview, and a Zoom API failure does the same.
+* Add a reconciliation step for partial Zoom/Sheets writes: `createZoomMeeting` runs before the column-I batch update, so a failed update leaves an orphaned Zoom meeting with no stored link.
+* Make `/create` transactional: it inserts the row and then writes `A:H` in a second API call, so a failed write leaves an empty inserted row.
+* Resync Zoom and Calendar when `/update` changes a class date or time; today only the Sheets cells are rewritten.
 
 ---
 

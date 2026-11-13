@@ -4,15 +4,18 @@ This app provides Telegram commands for viewing and editing the shared TCR class
 
 ## Commands
 
-- `/help` or `/start` — show command help.
-- `/check` — show the number of unsent schedule rows.
+- `/help` or `/start` — show command help and refresh the Telegram command menu.
+- `/today`, `/tomorrow` — list classes for that date (Asia/Kolkata).
 - `/list [date or search text]` — list all classes or filter by date, center, course, subject, or faculty.
-- `/preview` — preview only tomorrow’s pending classes. Message headings append `(LN)` for Laxmi Nagar and `(HK)` for Hauz Khas; only eligible Laxmi Nagar classes get Zoom links. Existing Laxmi Nagar Zoom meetings are updated from current sheet details before the preview is sent.
+- `/preview` — preview only tomorrow’s complete, unsent classes. Message headings append `(LN)` for Laxmi Nagar and `(HK)` for Hauz Khas; only eligible Laxmi Nagar classes get Zoom links. Existing Laxmi Nagar Zoom meetings are updated from current sheet details before the preview is sent. Each group message carries inline buttons: `Open WhatsApp` (a `wa.me` link with the message pre-filled), `Mark as sent`, or `Generate Zoom & Prepare Send` when a link is still missing.
+- `/resend <row>` — clear G (status) and I (Zoom URL) so `/preview` can re-prepare the row.
+- `/undo <row>` — clear `SENT` in G but keep the Zoom URL in I.
 - `/chat add <chat-id>`, `/chat remove <chat-id>`, or `/chat list` — manage authorized Telegram chats from the administrator’s private chat; IDs are stored in the `AuthorizedChats` tab of the schedule spreadsheet.
-
 - `/create` or `/add` — add a class using comma-separated, pipe-separated, multiline, or key-value input. It inserts a row and writes explicitly to A:H (G is left blank for the dispatch status; the Calendar `iCalUID` is stored in H). Class date/time input is treated as Asia/Kolkata (IST) when creating Calendar events.
-- `/update <row> <field> <value>` — update one field, or provide a complete row.
+- `/update <row> <field> <value>` — update one field, or provide a complete row. Supported fields are Date, Time, Center, Course, Subject, Faculty, and Status; changing a detail field clears G and the stored Zoom URL in I.
 - `/delete <row>` — delete its linked Calendar event from column H, then delete the schedule row. If deleting the Calendar event fails, the row is retained.
+
+`/preview` buttons carry a short signature over the group and its rows. If the sheet changes between sending the preview and tapping a button, the callback is rejected with “This preview is out of date. Run /preview again.”
 
 `/start` and `/help` register Telegram's command menu, which includes `/help`. Command failures are reported in the chat with a safe error summary and a reference ID for Vercel logs. If Calendar event creation fails, `/create` reports that it saved the row without the event. Deleting a row directly in Google Sheets does not run bot cleanup; use `/delete` when the linked Calendar event should also be removed.
 
@@ -41,9 +44,9 @@ The webhook accepts Telegram `POST` updates at `/` only when the `X-Telegram-Bot
 https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://<YOUR_VERCEL_DOMAIN>/&secret_token=<TELEGRAM_WEBHOOK_SECRET>
 ```
 
-Check the result with Telegram's `getWebhookInfo` endpoint. Do not include either secret in shell history, chat messages, or repository files. Since Telegram webhooks cannot add a Vercel SSO login, the Vercel production endpoint must be publicly reachable; the webhook-secret validation protects POST updates.
+Check the result with Telegram's `getWebhookInfo` endpoint. Register with `"allowed_updates": ["message", "callback_query"]` (or omit the field): the `/preview` buttons arrive as callback queries, so a webhook limited to `message` leaves the buttons non-functional. Do not include either secret in shell history, chat messages, or repository files. Since Telegram webhooks cannot add a Vercel SSO login, the Vercel production endpoint must be publicly reachable; the webhook-secret validation protects POST updates. A POST is also refused with HTTP 500 when any required variable is empty; the response lists the missing names.
 
-The Vercel cron sends `/preview` results to `AUTHORIZED_CHAT_ID` every day at 16:28 Asia/Kolkata (10:58 UTC). Vercel authenticates cron requests with `Authorization: Bearer <CRON_SECRET>`. The preview reads and writes Zoom URLs in column I; add `Zoom URL` to cell I1 before using `/preview`. Zoom links are generated and refreshed only for eligible Laxmi Nagar classes; Hauz Khas messages omit Zoom links. Preview headings identify Laxmi Nagar with `(LN)` and Hauz Khas with `(HK)`. Existing eligible Zoom meetings are refreshed with the row’s current title, date, time, and duration, so direct spreadsheet edits are reflected in the meeting. Marking a row sent writes `SENT` to column G directly through the Sheets API. Telegram `/update` clears the stored link when class details change.
+The Vercel cron sends `/preview` results to `AUTHORIZED_CHAT_ID` every day at 16:28 Asia/Kolkata (10:58 UTC), hitting `GET /api/cron` as configured in `vercel.json`. Vercel authenticates cron requests with `Authorization: Bearer <CRON_SECRET>`; a missing `CRON_SECRET` returns 500 and a wrong/missing bearer token returns 401. The preview reads and writes Zoom URLs in column I; add `Zoom URL` to cell I1 before using `/preview`. Zoom links are generated and refreshed only for eligible Laxmi Nagar classes; Hauz Khas messages omit Zoom links. Preview headings identify Laxmi Nagar with `(LN)` and Hauz Khas with `(HK)`. Existing eligible Zoom meetings are refreshed with the row’s current title, date, time, and duration, so direct spreadsheet edits are reflected in the meeting. Marking a row sent writes `SENT` to column G directly through the Sheets API. Telegram `/update` clears the stored link when class details change. Any non-POST request other than `/api/cron` returns the plain-text health message.
 
 The `/chat` commands create the `AuthorizedChats` tab automatically if it does not exist. The fixed administrator is Telegram user ID `499900380`; access management is accepted only in that account’s private chat, and the administrator cannot be removed. Cell A1 is the `Chat ID` header; one authorized Telegram chat ID is stored per row below it. Positive private-chat IDs and negative group-chat IDs are accepted. The existing `AUTHORIZED_CHAT_ID` is copied into the list when the tab is first initialized and can later be removed with `/chat remove`.
 
@@ -56,7 +59,7 @@ npm ci
 npm test
 ```
 
-The tests exercise schedule parsing, filtering, insertion ordering, configuration validation, and the health endpoint without modifying the live spreadsheet or sending Telegram messages.
+The tests exercise schedule parsing, filtering, insertion ordering, configuration validation, webhook-secret and cron-auth checks, Zoom start-time/sync behavior, preview grouping and keyboard construction, chat-ID normalization, and the health endpoint without modifying the live spreadsheet or sending Telegram messages.
 
 The old create path used Sheets `values.append`, which could place a newly-created record to the right of the schedule table. The explicit insert-and-write path prevents future row shifts; it does not automatically repair an entry created by the old behavior. Back up the sheet and move that entry's six class fields into A:F, leaving G empty and preserving its verified Calendar event ID in H.
 
