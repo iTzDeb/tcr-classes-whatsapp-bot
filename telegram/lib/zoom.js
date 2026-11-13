@@ -159,9 +159,64 @@ function extractZoomMeetingId(joinUrl) {
   }
 }
 
+function zoomApiError(action, row, meetingId, status, body) {
+  const details = [
+    `HTTP ${status}`,
+    body && body.code ? `code ${body.code}` : null,
+    `meeting ${meetingId}`
+  ].filter(Boolean).join(', ');
+  const error = new Error(`Zoom ${action} failed for row ${row.rowIndex} (${details}): ${(body && body.message) || 'unknown error'}`);
+  error.zoomStatus = status;
+  error.zoomCode = body && body.code;
+  error.rowIndex = row.rowIndex;
+  return error;
+}
+
+function isUnverifiableZoomError(error) {
+  return error.zoomStatus === 404 || error.zoomCode === 2300;
+}
+
+async function getZoomMeeting(row, fetchImpl = fetch) {
+  const meetingId = extractZoomMeetingId(row.zoomUrl);
+  if (!meetingId) throw new Error(`Stored Zoom URL for row ${row.rowIndex} is invalid; no meeting was checked.`);
+
+  const accessToken = await getZoomAccessToken(fetchImpl);
+  const response = await fetchImpl(`${ZOOM_API_BASE_URL}/meetings/${meetingId}`, {
+    method: 'GET',
+    headers: { Authorization: `Bearer ${accessToken}` },
+    signal: AbortSignal.timeout(10000)
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw zoomApiError('meeting lookup', row, meetingId, response.status, body);
+  return body;
+}
+
+function expectedStartUtcMs(row) {
+  const date = parseDateParts(row.date);
+  const scheduleTime = parseScheduleTime(row.time);
+  if (!date || !scheduleTime) return null;
+  const istOffsetMinutes = 5 * 60 + 30;
+  return Date.UTC(date.year, date.month - 1, date.day) + (scheduleTime.startMinutes - istOffsetMinutes) * 60000;
+}
+
+function meetingMatches(row, meeting) {
+  const expected = getZoomMeetingUpdate(row);
+  const expectedMs = expectedStartUtcMs(row);
+  const actualMs = Date.parse(meeting.start_time);
+  return meeting.topic === expected.topic
+    && Number(meeting.duration) === Number(expected.duration)
+    && expectedMs !== null
+    && Number.isFinite(actualMs)
+    && Math.abs(actualMs - expectedMs) <= 60000;
+}
+
+// Returns 'unchanged' when the stored meeting already matches the sheet, 'updated' after a PUT.
 async function syncZoomMeeting(row, fetchImpl = fetch) {
   const meetingId = extractZoomMeetingId(row.zoomUrl);
   if (!meetingId) throw new Error(`Stored Zoom URL for row ${row.rowIndex} is invalid; no meeting was updated.`);
+
+  const meeting = await getZoomMeeting(row, fetchImpl);
+  if (meetingMatches(row, meeting)) return 'unchanged';
 
   const accessToken = await getZoomAccessToken(fetchImpl);
   const meetingResponse = await fetchImpl(`${ZOOM_API_BASE_URL}/meetings/${meetingId}`, {
@@ -174,31 +229,20 @@ async function syncZoomMeeting(row, fetchImpl = fetch) {
     body: JSON.stringify(getZoomMeetingUpdate(row))
   });
   const meetingBody = await meetingResponse.json().catch(() => ({}));
-  if (!meetingResponse.ok) {
-    const details = [
-      `HTTP ${meetingResponse.status}`,
-      meetingBody.code ? `code ${meetingBody.code}` : null,
-      `meeting ${meetingId}`
-    ].filter(Boolean).join(', ');
-    const error = new Error(`Zoom meeting update failed for row ${row.rowIndex} (${details}): ${meetingBody.message || 'unknown error'}`);
-    error.zoomStatus = meetingResponse.status;
-    error.zoomCode = meetingBody.code;
-    error.rowIndex = row.rowIndex;
-    throw error;
-  }
-  return true;
+  if (!meetingResponse.ok) throw zoomApiError('meeting update', row, meetingId, meetingResponse.status, meetingBody);
+  return 'updated';
 }
 
-async function createZoomMeeting(row) {
+async function createZoomMeeting(row, fetchImpl = fetch) {
   const scheduleTime = parseScheduleTime(row.time);
   const startTime = formatZoomStartTime(row.date, row.time);
   if (!startTime || !scheduleTime) {
     throw new Error(`Could not parse the schedule date/time for row ${row.rowIndex}.`);
   }
 
-  const accessToken = await getZoomAccessToken(fetch);
+  const accessToken = await getZoomAccessToken(fetchImpl);
   const topic = `TCR ${row.center} ${row.course} - ${row.subject} (${row.faculty})`;
-  const meetingResponse = await fetch(`${ZOOM_API_BASE_URL}/users/me/meetings`, {
+  const meetingResponse = await fetchImpl(`${ZOOM_API_BASE_URL}/users/me/meetings`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -230,6 +274,9 @@ async function createZoomMeeting(row) {
 module.exports = {
   createZoomMeeting,
   syncZoomMeeting,
+  getZoomMeeting,
+  meetingMatches,
+  isUnverifiableZoomError,
   extractZoomMeetingId,
   getZoomMeetingUpdate,
   formatZoomStartTime,

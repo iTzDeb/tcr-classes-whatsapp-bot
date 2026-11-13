@@ -1,7 +1,7 @@
 const assert = require('assert');
 const telegramWebhook = require('./api/index');
 const preview = require('./lib/preview');
-const { formatZoomStartTime, getZoomDurationMins, extractZoomMeetingId, syncZoomMeeting } = require('./lib/zoom');
+const { formatZoomStartTime, getZoomDurationMins, extractZoomMeetingId, syncZoomMeeting, meetingMatches } = require('./lib/zoom');
 const chatAccess = require('./lib/chatAccess');
 const voice = require('./lib/voice');
 const drafts = require('./lib/drafts');
@@ -33,7 +33,7 @@ const {
   formatGroupMessage,
   formatScheduleDate,
   buildKeyboard,
-  syncExistingZoomMeetings
+  reconcileStoredZoomLinks
 } = preview;
 
 console.log('Running search/filter, natural input & chronological sorting tests...');
@@ -56,31 +56,47 @@ assert.strictEqual(extractZoomMeetingId('https://evil.example/j/123456789'), nul
   'Only Zoom meeting URLs should be accepted');
 
 async function testZoomMeetingSyncUsesCurrentSchedule() {
-  const calls = [];
-  const env = {
-    ZOOM_ACCOUNT_ID: process.env.ZOOM_ACCOUNT_ID,
-    ZOOM_CLIENT_ID: process.env.ZOOM_CLIENT_ID,
-    ZOOM_CLIENT_SECRET: process.env.ZOOM_CLIENT_SECRET
-  };
+  const env = { ZOOM_ACCOUNT_ID: process.env.ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID: process.env.ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET: process.env.ZOOM_CLIENT_SECRET };
   process.env.ZOOM_ACCOUNT_ID = 'account';
   process.env.ZOOM_CLIENT_ID = 'client';
   process.env.ZOOM_CLIENT_SECRET = 'secret';
-  const fetchImpl = async (url, options) => {
-    calls.push({ url, options });
-    return calls.length === 1
-      ? { ok: true, json: async () => ({ access_token: 'access-token' }) }
-      : { ok: true, json: async () => ({}) };
+  const row = {
+    rowIndex: 7, date: '05 Nov 2026', time: '04:00PM - 06:00PM',
+    center: 'Laxmi Nagar', course: 'CLAT', subject: 'Updated Legal', faculty: 'New Faculty',
+    zoomUrl: 'https://zoom.us/j/123456789?pwd=abc'
+  };
+  const matchingMeeting = {
+    topic: 'TCR Laxmi Nagar CLAT - Updated Legal (New Faculty)',
+    duration: 120,
+    start_time: '2026-11-05T10:30:00Z',
+    timezone: 'Asia/Kolkata'
   };
   try {
-    await syncZoomMeeting({
-      rowIndex: 7, date: '05 Nov 2026', time: '04:00PM - 06:00PM',
-      center: 'Laxmi Nagar', course: 'CLAT', subject: 'Updated Legal', faculty: 'New Faculty',
-      zoomUrl: 'https://zoom.us/j/123456789?pwd=abc'
-    }, fetchImpl);
-    assert.strictEqual(calls.length, 2, 'Sync should authenticate and update the existing Zoom meeting');
-    assert.match(calls[1].url, /\/meetings\/123456789$/);
-    assert.strictEqual(calls[1].options.method, 'PUT');
-    assert.deepStrictEqual(JSON.parse(calls[1].options.body), {
+    assert.strictEqual(meetingMatches(row, matchingMeeting), true, 'A meeting with the same topic, duration and IST start must match');
+    assert.strictEqual(meetingMatches(row, { ...matchingMeeting, topic: 'old topic' }), false, 'A different topic must not match');
+
+    const matchCalls = [];
+    const matchFetch = async (url, options) => {
+      matchCalls.push({ url, options });
+      if (url.includes('/oauth/token')) return { ok: true, json: async () => ({ access_token: 'access-token' }) };
+      return { ok: true, json: async () => matchingMeeting };
+    };
+    assert.strictEqual(await syncZoomMeeting(row, matchFetch), 'unchanged', 'A matching meeting must not be updated');
+    assert.strictEqual(matchCalls.length, 2, 'Only the token and the meeting lookup should be requested');
+    assert.strictEqual(matchCalls[1].options.method, 'GET');
+
+    const updateCalls = [];
+    const updateFetch = async (url, options) => {
+      updateCalls.push({ url, options });
+      if (url.includes('/oauth/token')) return { ok: true, json: async () => ({ access_token: 'access-token' }) };
+      if (options.method === 'GET') return { ok: true, json: async () => ({ ...matchingMeeting, duration: 30 }) };
+      return { ok: true, json: async () => ({}) };
+    };
+    assert.strictEqual(await syncZoomMeeting(row, updateFetch), 'updated');
+    const put = updateCalls.find(call => call.options.method === 'PUT');
+    assert.ok(put, 'A drifted meeting must be updated in place');
+    assert.match(put.url, /\/meetings\/123456789$/);
+    assert.deepStrictEqual(JSON.parse(put.options.body), {
       topic: 'TCR Laxmi Nagar CLAT - Updated Legal (New Faculty)',
       type: 2,
       start_time: '2026-11-05T16:00:00',
@@ -95,45 +111,30 @@ async function testZoomMeetingSyncUsesCurrentSchedule() {
   }
 }
 
-async function testSyncExistingZoomMeetingsSyncsEveryStoredMeeting() {
-  const calls = [];
-  const env = {
-    ZOOM_ACCOUNT_ID: process.env.ZOOM_ACCOUNT_ID,
-    ZOOM_CLIENT_ID: process.env.ZOOM_CLIENT_ID,
-    ZOOM_CLIENT_SECRET: process.env.ZOOM_CLIENT_SECRET
-  };
+async function testReconcileStoredZoomLinksUpdatesMismatchedMeetings() {
+  const env = { ZOOM_ACCOUNT_ID: process.env.ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID: process.env.ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET: process.env.ZOOM_CLIENT_SECRET };
   process.env.ZOOM_ACCOUNT_ID = 'account';
   process.env.ZOOM_CLIENT_ID = 'client';
   process.env.ZOOM_CLIENT_SECRET = 'secret';
+  const calls = [];
   const fetchImpl = async (url, options) => {
     calls.push({ url, options });
-    return url.includes('/oauth/token')
-      ? { ok: true, json: async () => ({ access_token: 'access-token' }) }
-      : { ok: true, json: async () => ({}) };
+    if (url.includes('/oauth/token')) return { ok: true, json: async () => ({ access_token: 'access-token' }) };
+    if (options.method === 'GET') return { ok: true, json: async () => ({ topic: 'stale', duration: 30, start_time: '2020-01-01T00:00:00Z' }) };
+    return { ok: true, json: async () => ({}) };
   };
   try {
-    const failures = await syncExistingZoomMeetings([
-      {
-        rowIndex: 7, date: '05 Nov 2026', time: '04:00PM - 06:00PM',
-        center: 'Laxmi Nagar', course: 'CLAT', subject: 'Legal', faculty: 'Shivam Sir',
-        zoomUrl: 'https://zoom.us/j/123456789'
-      },
-      {
-        rowIndex: 8, date: '05 Nov 2026', time: '06:00PM - 08:00PM',
-        center: 'Laxmi Nagar', course: 'CLAT', subject: 'English', faculty: 'Anand Sir',
-        zoomUrl: 'https://zoom.us/j/987654321'
-      }
-    ], fetchImpl);
-    assert.strictEqual(calls.length, 4, 'Both stored Zoom meetings should be updated through the injected fetch');
+    const { failures, replaced } = await reconcileStoredZoomLinks([
+      { rowIndex: 7, date: '05 Nov 2026', time: '04:00PM - 06:00PM', center: 'Laxmi Nagar', course: 'CLAT', subject: 'Legal', faculty: 'Shivam Sir', zoomUrl: 'https://zoom.us/j/123456789' },
+      { rowIndex: 8, date: '05 Nov 2026', time: '06:00PM - 08:00PM', center: 'Laxmi Nagar', course: 'CLAT', subject: 'English', faculty: 'Anand Sir', zoomUrl: 'https://zoom.us/j/987654321' }
+    ], { fetchImpl });
+    assert.deepStrictEqual(failures, []);
+    assert.deepStrictEqual(replaced, [], 'Drifted meetings are updated in place, not replaced');
     assert.deepStrictEqual(
-      calls.filter(call => call.options && call.options.method === 'PUT').map(call => call.url),
-      [
-        'https://api.zoom.us/v2/meetings/123456789',
-        'https://api.zoom.us/v2/meetings/987654321'
-      ],
-      'Each row must update its own stored Zoom meeting'
+      calls.filter(call => call.options.method === 'PUT').map(call => call.url).sort(),
+      ['https://api.zoom.us/v2/meetings/123456789', 'https://api.zoom.us/v2/meetings/987654321'],
+      'Both stored meetings must be updated'
     );
-    assert.deepStrictEqual(failures, [], 'A successful refresh must report no failures');
   } finally {
     for (const [name, value] of Object.entries(env)) {
       if (value === undefined) delete process.env[name];
@@ -142,36 +143,75 @@ async function testSyncExistingZoomMeetingsSyncsEveryStoredMeeting() {
   }
 }
 
-async function testSyncExistingZoomMeetingsReportsFailures() {
-  const calls = [];
-  const env = {
-    ZOOM_ACCOUNT_ID: process.env.ZOOM_ACCOUNT_ID,
-    ZOOM_CLIENT_ID: process.env.ZOOM_CLIENT_ID,
-    ZOOM_CLIENT_SECRET: process.env.ZOOM_CLIENT_SECRET
-  };
+async function testReconcileStoredZoomLinksSkipsRowsWithoutStoredLink() {
+  const env = { ZOOM_ACCOUNT_ID: process.env.ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID: process.env.ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET: process.env.ZOOM_CLIENT_SECRET };
   process.env.ZOOM_ACCOUNT_ID = 'account';
   process.env.ZOOM_CLIENT_ID = 'client';
   process.env.ZOOM_CLIENT_SECRET = 'secret';
+  const calls = [];
+  const fetchImpl = async (url, options) => { calls.push({ url, options }); return { ok: true, json: async () => ({}) }; };
+  try {
+    const { failures } = await reconcileStoredZoomLinks([
+      { rowIndex: 9, date: '05 Nov 2026', time: '04:00 - 06:00PM', center: 'Laxmi Nagar', course: 'CLAT', subject: 'Legal', faculty: 'S', zoomUrl: '' },
+      { rowIndex: 10, date: '05 Nov 2026', time: '04:00 - 06:00PM', center: 'Hauz Khas', course: 'CLAT', subject: 'Legal', faculty: 'S', zoomUrl: 'https://zoom.us/j/987654321' }
+    ], { fetchImpl });
+    assert.deepStrictEqual(failures, []);
+    assert.strictEqual(calls.length, 0, 'Rows without a link, or that need no Zoom, must not be checked');
+  } finally {
+    for (const [name, value] of Object.entries(env)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
+
+async function testReconcileStoredZoomLinksRegeneratesUnverifiableLink() {
+  const env = { ZOOM_ACCOUNT_ID: process.env.ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID: process.env.ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET: process.env.ZOOM_CLIENT_SECRET };
+  process.env.ZOOM_ACCOUNT_ID = 'account';
+  process.env.ZOOM_CLIENT_ID = 'client';
+  process.env.ZOOM_CLIENT_SECRET = 'secret';
+  const writes = [];
+  const sheets = { spreadsheets: { values: { update: async request => { writes.push(request); return { data: {} }; } } } };
+  const sheet = { title: 'Schedule', sheetId: 1 };
   const fetchImpl = async (url, options) => {
-    calls.push({ url, options });
-    return url.includes('/oauth/token')
-      ? { ok: true, json: async () => ({ access_token: 'access-token' }) }
-      : { ok: false, status: 404, json: async () => ({ code: 2300, message: 'This API endpoint is not recognized.' }) };
+    if (url.includes('/oauth/token')) return { ok: true, json: async () => ({ access_token: 'access-token' }) };
+    if (options.method === 'GET') return { ok: false, status: 404, json: async () => ({ code: 2300, message: 'This API endpoint is not recognized.' }) };
+    return { ok: true, json: async () => ({ join_url: 'https://zoom.us/j/555555555' }) };
+  };
+  const row = {
+    rowIndex: 127, date: '14 Nov 2026', time: '11:00AM - 12:30PM', center: 'Laxmi Nagar',
+    course: 'CUET', subject: 'Reasoning', faculty: 'Shobit Sir', zoomUrl: 'https://zoom.us/j/89533069786'
   };
   try {
-    const failures = await syncExistingZoomMeetings([{
-      rowIndex: 7, date: '05 Nov 2026', time: '04:00PM - 06:00PM',
-      center: 'Laxmi Nagar', course: 'CLAT', subject: 'Legal', faculty: 'Shivam Sir',
-      zoomUrl: 'https://zoom.us/j/123456789'
-    }], fetchImpl);
-    assert.strictEqual(failures.length, 1, 'A failed Zoom refresh must resolve with one failure entry, not reject');
-    assert.strictEqual(failures[0].rowIndex, 7);
-    assert.match(
-      failures[0].message,
-      /row 7 \(HTTP 404, code 2300, meeting 123456789\)/,
-      'The failure message must name the row, HTTP status, Zoom code, and meeting ID'
-    );
-    assert.strictEqual(calls.length, 2, 'The failed meeting should still have been attempted');
+    const { failures, replaced } = await reconcileStoredZoomLinks([row], { fetchImpl, sheets, sheet });
+    assert.deepStrictEqual(failures, []);
+    assert.deepStrictEqual(replaced, [127], 'An unverifiable meeting must be replaced with a new one');
+    assert.strictEqual(row.zoomUrl, 'https://zoom.us/j/555555555');
+    assert.strictEqual(writes.length, 1);
+    assert.strictEqual(writes[0].range, "'Schedule'!I127");
+    assert.deepStrictEqual(writes[0].requestBody.values, [['https://zoom.us/j/555555555']]);
+  } finally {
+    for (const [name, value] of Object.entries(env)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
+
+async function testReconcileStoredZoomLinksReportsFailuresWithoutSheets() {
+  const env = { ZOOM_ACCOUNT_ID: process.env.ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID: process.env.ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET: process.env.ZOOM_CLIENT_SECRET };
+  process.env.ZOOM_ACCOUNT_ID = 'account';
+  process.env.ZOOM_CLIENT_ID = 'client';
+  process.env.ZOOM_CLIENT_SECRET = 'secret';
+  const fetchImpl = async (url) => {
+    if (url.includes('/oauth/token')) return { ok: true, json: async () => ({ access_token: 'access-token' }) };
+    return { ok: false, status: 404, json: async () => ({ code: 2300, message: 'This API endpoint is not recognized.' }) };
+  };
+  try {
+    const { failures, replaced } = await reconcileStoredZoomLinks([{ rowIndex: 7, date: '05 Nov 2026', time: '04:00PM - 06:00PM', center: 'Laxmi Nagar', course: 'CLAT', subject: 'Legal', faculty: 'S', zoomUrl: 'https://zoom.us/j/123456789' }], { fetchImpl });
+    assert.strictEqual(failures.length, 1);
+    assert.deepStrictEqual(replaced, []);
+    assert.match(failures[0].message, /row 7 \(HTTP 404, code 2300, meeting 123456789\)/);
   } finally {
     for (const [name, value] of Object.entries(env)) {
       if (value === undefined) delete process.env[name];
@@ -182,48 +222,12 @@ async function testSyncExistingZoomMeetingsReportsFailures() {
 
 async function testZoomEnvSuite() {
   await testZoomMeetingSyncUsesCurrentSchedule();
-  await testSyncExistingZoomMeetingsSyncsEveryStoredMeeting();
-  await testSyncExistingZoomMeetingsReportsFailures();
-  await testSyncExistingZoomMeetingsSkipsRowsWithoutPendingZoom();
+  await testReconcileStoredZoomLinksUpdatesMismatchedMeetings();
+  await testReconcileStoredZoomLinksSkipsRowsWithoutStoredLink();
+  await testReconcileStoredZoomLinksRegeneratesUnverifiableLink();
+  await testReconcileStoredZoomLinksReportsFailuresWithoutSheets();
 }
 
-async function testSyncExistingZoomMeetingsSkipsRowsWithoutPendingZoom() {
-  const calls = [];
-  const env = {
-    ZOOM_ACCOUNT_ID: process.env.ZOOM_ACCOUNT_ID,
-    ZOOM_CLIENT_ID: process.env.ZOOM_CLIENT_ID,
-    ZOOM_CLIENT_SECRET: process.env.ZOOM_CLIENT_SECRET
-  };
-  process.env.ZOOM_ACCOUNT_ID = 'account';
-  process.env.ZOOM_CLIENT_ID = 'client';
-  process.env.ZOOM_CLIENT_SECRET = 'secret';
-  const fetchImpl = async (url, options) => {
-    calls.push({ url, options });
-    return url.includes('/oauth/token')
-      ? { ok: true, json: async () => ({ access_token: 'access-token' }) }
-      : { ok: true, json: async () => ({}) };
-  };
-  try {
-    await syncExistingZoomMeetings([
-      {
-        rowIndex: 9, date: '05 Nov 2026', time: '04:00PM - 06:00PM',
-        center: 'Laxmi Nagar', course: 'CLAT', subject: 'Legal', faculty: 'Shivam Sir',
-        zoomUrl: ''
-      },
-      {
-        rowIndex: 10, date: '05 Nov 2026', time: '04:00PM - 06:00PM',
-        center: 'Hauz Khas', course: 'CLAT', subject: 'Legal', faculty: 'Shivam Sir',
-        zoomUrl: 'https://zoom.us/j/987654321'
-      }
-    ], fetchImpl);
-    assert.strictEqual(calls.length, 0, 'Rows without a Zoom need or without a stored link must not be synced');
-  } finally {
-    for (const [name, value] of Object.entries(env)) {
-      if (value === undefined) delete process.env[name];
-      else process.env[name] = value;
-    }
-  }
-}
 
 assert.deepStrictEqual(Object.keys(preview).sort(), [
   'answerCallbackQuery',
@@ -238,10 +242,10 @@ assert.deepStrictEqual(Object.keys(preview).sort(), [
   'isPendingPreviewRow',
   'markRowsSent',
   'prepareZoomSend',
+  'reconcileStoredZoomLinks',
   'runPreview',
   'scheduleDateKey',
-  'sendTelegramMessage',
-  'syncExistingZoomMeetings'
+  'sendTelegramMessage'
 ]);
 
 const previewRows = [

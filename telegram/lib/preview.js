@@ -2,7 +2,7 @@ const https = require('https');
 const crypto = require('crypto');
 const { google } = require('googleapis');
 const { getGoogleAuth } = require('./googleAuth');
-const { createZoomMeeting, syncZoomMeeting } = require('./zoom');
+const { createZoomMeeting, syncZoomMeeting, isUnverifiableZoomError } = require('./zoom');
 
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -335,18 +335,45 @@ function buildKeyboard(group) {
   return { inline_keyboard: keyboard };
 }
 
-async function syncExistingZoomMeetings(rows, fetchImpl = fetch) {
+async function writeZoomUrl(sheets, sheet, rowIndex, zoomUrl) {
+  if (!sheets || !sheet) return;
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `'${sheet.title.replace(/'/g, "''")}'!I${rowIndex}`,
+    valueInputOption: 'RAW',
+    requestBody: { values: [[zoomUrl]] }
+  });
+}
+
+// Keeps a stored link when it matches, updates it in place when details drifted,
+// and only mints a new meeting when Zoom cannot verify the stored one.
+async function reconcileStoredZoomLinks(rows, { fetchImpl = fetch, sheets = null, sheet = null } = {}) {
   const pending = rows.filter(row => rowNeedsZoom(row) && row.zoomUrl);
   const failures = [];
+  const replaced = [];
   for (const row of pending) {
     try {
       await syncZoomMeeting(row, fetchImpl);
     } catch (error) {
+      if (isUnverifiableZoomError(error) && sheets && sheet) {
+        try {
+          const zoomUrl = await createZoomMeeting(row, fetchImpl);
+          await writeZoomUrl(sheets, sheet, row.rowIndex, zoomUrl);
+          row.zoomUrl = zoomUrl;
+          replaced.push(row.rowIndex);
+          console.error('Zoom link regenerated:', { rowIndex: row.rowIndex, reason: error.message });
+          continue;
+        } catch (createError) {
+          failures.push({ rowIndex: row.rowIndex, message: createError.message });
+          console.error('Zoom link regeneration failed:', { rowIndex: row.rowIndex, message: createError.message });
+          continue;
+        }
+      }
       failures.push({ rowIndex: row.rowIndex, message: error.message });
       console.error('Zoom refresh failed:', { rowIndex: row.rowIndex, message: error.message });
     }
   }
-  return failures;
+  return { failures, replaced };
 }
 
 function zoomWarning(rowIndices) {
@@ -355,17 +382,26 @@ function zoomWarning(rowIndices) {
   return `\n\n⚠️ Zoom link refresh failed for row(s) ${list}. Run /resend ${rowIndices[0]} then /preview to regenerate the link.`;
 }
 
+function zoomReplacedNote(rowIndices) {
+  if (!rowIndices.length) return '';
+  return `\n\n♻️ Zoom link regenerated for row(s) ${rowIndices.join(', ')} because the stored meeting could not be verified.`;
+}
+
 async function runPreview(chatId) {
   const rows = await fetchPendingRows();
-  const failures = await syncExistingZoomMeetings(rows);
+  const sheets = getSheetsClient();
+  const sheet = await getSheetDetails(sheets);
+  const { failures, replaced } = await reconcileStoredZoomLinks(rows, { sheets, sheet });
   const failedRows = new Set(failures.map(failure => failure.rowIndex));
+  const replacedRows = new Set(replaced);
   const groups = groupPendingRows(rows);
   if (!groups.length) {
     await sendTelegramMessage(chatId, '📅 No upcoming pending or prepared classes were found.');
     return 0;
   }
   for (const group of groups) {
-    const warning = zoomWarning(group.rowIndices.filter(rowIndex => failedRows.has(rowIndex)));
+    const warning = zoomWarning(group.rowIndices.filter(rowIndex => failedRows.has(rowIndex)))
+      + zoomReplacedNote(group.rowIndices.filter(rowIndex => replacedRows.has(rowIndex)));
     await sendTelegramMessage(chatId, formatGroupMessage(group) + warning, {
       parse_mode: 'Markdown',
       reply_markup: buildKeyboard(group)
@@ -408,20 +444,11 @@ async function readRowsByIndex(rowIndices) {
 async function prepareZoomSend(rowIndices, chatId) {
   if (!chatId) throw new Error('prepareZoomSend needs the chat that requested the preview.');
   const { sheets, sheet, rows } = await readRowsByIndex(rowIndices);
+  const { failures, replaced } = await reconcileStoredZoomLinks(rows, { sheets, sheet });
   const values = [];
-  const failedRows = [];
+  const failedRows = failures.map(failure => failure.rowIndex);
   for (const row of rows) {
-    if (row.zoomUrl) {
-      if (rowNeedsZoom(row)) {
-        try {
-          await syncZoomMeeting(row);
-        } catch (error) {
-          failedRows.push(row.rowIndex);
-          console.error('Zoom refresh failed:', { rowIndex: row.rowIndex, message: error.message });
-        }
-      }
-      continue;
-    }
+    if (row.zoomUrl) continue;
     if (!rowNeedsZoom(row)) continue;
     const zoomUrl = await createZoomMeeting(row);
     row.zoomUrl = zoomUrl;
@@ -440,7 +467,7 @@ async function prepareZoomSend(rowIndices, chatId) {
     });
   }
   const group = groupPendingRows(rows)[0];
-  await sendTelegramMessage(chatId, formatGroupMessage(group) + zoomWarning(failedRows), {
+  await sendTelegramMessage(chatId, formatGroupMessage(group) + zoomWarning(failedRows) + zoomReplacedNote(replaced), {
     parse_mode: 'Markdown',
     reply_markup: buildKeyboard(group)
   });
@@ -479,5 +506,5 @@ module.exports = {
   scheduleDateKey,
   indiaDateKey,
   buildKeyboard,
-  syncExistingZoomMeetings
+  reconcileStoredZoomLinks
 };
