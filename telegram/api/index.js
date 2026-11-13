@@ -16,6 +16,8 @@ const {
 } = require('../lib/preview');
 const { getGoogleAuth } = require('../lib/googleAuth');
 const { ADMIN_USER_ID, normalizeChatId, listAuthorizedChatIds, addAuthorizedChatId, removeAuthorizedChatId, isAuthorizedChat } = require('../lib/chatAccess');
+const { isVoiceConfigured, transcribeVoice, looksLikeCreateRequest, extractClasses, validateClasses } = require('../lib/voice');
+const { saveDraft, takeDraft } = require('../lib/drafts');
 
 // Configuration Constants
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
@@ -23,6 +25,9 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const AUTHORIZED_CHAT_ID = process.env.AUTHORIZED_CHAT_ID;
 const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET;
 const DEFAULT_SHEET_TAB = 'Schedule';
+const MAX_VOICE_FILE_BYTES = 20 * 1024 * 1024;
+const VOICE_CENTERS = ['Laxmi Nagar', 'Hauz Khas'];
+const VOICE_COURSES = ['CLAT', 'CUET', 'AILET', 'AIBE', 'CLAT 28', 'GS Foundation'];
 const crypto = require('crypto');
 
 const TELEGRAM_COMMANDS = [
@@ -580,16 +585,20 @@ module.exports = async (req, res) => {
         return;
       }
       try {
-        await handlePreviewCallback(callbackQuery);
+        const callbackData = String(callbackQuery.data || '');
+        if (/^draft:/.test(callbackData) || /^draft-cancel:/.test(callbackData)) {
+          await handleDraftCallback(callbackQuery);
+        } else {
+          await handlePreviewCallback(callbackQuery);
+        }
       } catch (error) {
-        console.error('Preview callback failed:', error);
+        console.error('Callback handling failed:', error);
         await answerCallbackQuery(callbackQuery.id, `Action failed: ${error.message}`);
       }
     }
 
-    if (payload.message && payload.message.text) {
+    if (payload.message && (payload.message.voice || payload.message.text)) {
       const message = payload.message;
-      const text = message.text.trim();
       const chatId = message.chat.id;
       const userId = message.from ? message.from.id : null;
 
@@ -600,7 +609,11 @@ module.exports = async (req, res) => {
         res.status(200).json({ ok: true });
         return;
       }
-      await handleTelegramCommand(chatId, text, { userId, chatType: message.chat?.type });
+      if (message.voice) {
+        await handleVoiceMessage(message);
+      } else {
+        await handleTelegramCommand(chatId, message.text.trim(), { userId, chatType: message.chat?.type });
+      }
     }
 
     res.status(200).json({ ok: true });
@@ -627,6 +640,7 @@ async function handleTelegramCommand(chatId, text, context = {}) {
       `   e.g. \`/list 4 Oct\`, \`/list Laxmi Nagar\`, \`/list CLAT\`\n` +
       `*Edit*\n` +
       `📌 */create* _Details_ — Add a class (comma/pipe/newline format)\n` +
+      `🎙 Send a voice note to create one or more classes.\n` +
       `📌 */update* _Row Field Value_ — Update one field\n` +
       `   e.g. \`/update 15 Faculty Anand Sir\`\n` +
       `📌 */resend* _Row_ — Reset a row for resending\n` +
@@ -807,32 +821,8 @@ async function handleListCommand(chatId, filterText) {
   await sendRowList(chatId, title, matchingRows);
 }
 
-async function handleCreateCommand(chatId, argsStr) {
-  const parsed = parseCreateArgs(argsStr);
-
-  if (!hasCompleteScheduleDetails(parsed || {})) {
-    const usageMsg =
-      `⚠️ *How to create a class:*\n\n` +
-      `*Comma separated:*\n` +
-      `\`/create 06 Sept 2026, 4:00 - 6:00PM, Laxmi Nagar, CLAT, Legal, Shivam Sir\`\n\n` +
-      `*Key-Value:*\n` +
-      `\`/create\`\n` +
-      `\`Date: 06 Sept 2026\`\n` +
-      `\`Time: 4:00 - 6:00PM\`\n` +
-      `\`Center: Laxmi Nagar\`\n` +
-      `\`Course: CLAT\`\n` +
-      `\`Subject: Legal\`\n` +
-      `\`Faculty: Shivam Sir\``;
-    await sendTelegramMessage(chatId, usageMsg);
-    return;
-  }
-
-  const { date: dateVal, time: timeVal, center: centerVal, course: courseVal, subject: subjectVal, faculty: facultyVal } = parsed;
-  const startTimeMinutes = parseStartTimeToMinutes(timeVal);
-  if (!parseDateStrToVal(dateVal) || startTimeMinutes === null) {
-    await sendTelegramMessage(chatId, `⚠️ Invalid date or start time. Use a valid date and time, for example \`31 Dec 2026, 01:00PM - 03:00PM\`.`);
-    return;
-  }
+async function createClassFromDetails(chatId, details, { notify = true } = {}) {
+  const { date: dateVal, time: timeVal, center: centerVal, course: courseVal, subject: subjectVal, faculty: facultyVal } = details;
 
   let calendarEventId = '';
   let calSyncText = '⏳ Pending';
@@ -863,18 +853,234 @@ async function handleCreateCommand(chatId, argsStr) {
 
   const existingRows = readRes.data.values || [];
   const targetRowIndex = findInsertionRowIndex(existingRows, parseDateStrToVal(dateVal), parseStartTimeToMinutes(timeVal));
-  await writeScheduleRow(sheets, sheetDetails, targetRowIndex, createScheduleRowValues(parsed, calendarEventId));
+  await writeScheduleRow(sheets, sheetDetails, targetRowIndex, createScheduleRowValues(details, calendarEventId));
 
-  const confirmMsg =
-    `✅ *Class Created!*\n\n` +
-    `📍 *Row:* ${targetRowIndex}\n` +
-    `🗓 *Date:* ${dateVal}\n` +
-    `⏰ *Time:* ${timeVal}\n` +
-    `🏛 *Center:* ${centerVal}\n` +
-    `📚 *Course:* ${courseVal} - ${subjectVal}\n` +
-    `👨‍🏫 *Faculty:* ${facultyVal}\n` +
-    `📅 *Calendar:* ${calSyncText}${calendarSyncFailure}`;
-  await sendTelegramMessage(chatId, confirmMsg);
+  if (notify) {
+    const confirmMsg =
+      `✅ *Class Created!*\n\n` +
+      `📍 *Row:* ${targetRowIndex}\n` +
+      `🗓 *Date:* ${dateVal}\n` +
+      `⏰ *Time:* ${timeVal}\n` +
+      `🏛 *Center:* ${centerVal}\n` +
+      `📚 *Course:* ${courseVal} - ${subjectVal}\n` +
+      `👨‍🏫 *Faculty:* ${facultyVal}\n` +
+      `📅 *Calendar:* ${calSyncText}${calendarSyncFailure}`;
+    await sendTelegramMessage(chatId, confirmMsg);
+  }
+  return targetRowIndex;
+}
+
+async function createClassesFromDetails(chatId, classes) {
+  if (classes.length === 1) {
+    const row = await createClassFromDetails(chatId, classes[0]);
+    return [{ row, ok: true, details: classes[0] }];
+  }
+
+  const results = [];
+  for (const details of classes) {
+    try {
+      results.push({ row: await createClassFromDetails(chatId, details, { notify: false }), ok: true, details });
+    } catch (error) {
+      results.push({ ok: false, error, details });
+    }
+  }
+
+  const created = results.filter(result => result.ok);
+  const failed = results.filter(result => !result.ok);
+  const header = failed.length
+    ? `⚠️ *Created ${created.length} of ${classes.length} classes.*`
+    : `✅ *Created ${created.length} classes!*`;
+  const lines = created.map(result =>
+    `📍 Row ${result.row}: ${result.details.date} - ${result.details.time} - ${result.details.center} - ${result.details.course}/${result.details.subject} - ${result.details.faculty}`
+  );
+  const failureLines = failed.length
+    ? ['', '❌ *Not created:*', ...failed.map(result => `• ${result.details.date || 'Class'} ${result.details.time || ''} — ${getSafeErrorDetails(result.error)}`)]
+    : [];
+  await sendTelegramMessage(chatId, [header, '', ...lines, ...failureLines].join('\n'));
+  return results;
+}
+
+function buildDraftKeyboard(draftId, classCount) {
+  return {
+    inline_keyboard: [[
+      { text: `✅ Create ${classCount} class${classCount === 1 ? '' : 'es'}`, callback_data: `draft:${draftId}` },
+      { text: '❌ Cancel', callback_data: `draft-cancel:${draftId}` }
+    ]]
+  };
+}
+
+async function handleCreateCommand(chatId, argsStr) {
+  const parsed = parseCreateArgs(argsStr);
+
+  if (!hasCompleteScheduleDetails(parsed || {})) {
+    const usageMsg =
+      `⚠️ *How to create a class:*\n\n` +
+      `*Comma separated:*\n` +
+      `\`/create 06 Sept 2026, 4:00 - 6:00PM, Laxmi Nagar, CLAT, Legal, Shivam Sir\`\n\n` +
+      `*Key-Value:*\n` +
+      `\`/create\`\n` +
+      `\`Date: 06 Sept 2026\`\n` +
+      `\`Time: 4:00 - 6:00PM\`\n` +
+      `\`Center: Laxmi Nagar\`\n` +
+      `\`Course: CLAT\`\n` +
+      `\`Subject: Legal\`\n` +
+      `\`Faculty: Shivam Sir\``;
+    await sendTelegramMessage(chatId, usageMsg);
+    return;
+  }
+
+  if (!parseDateStrToVal(parsed.date) || parseStartTimeToMinutes(parsed.time) === null) {
+    await sendTelegramMessage(chatId, `⚠️ Invalid date or start time. Use a valid date and time, for example \`31 Dec 2026, 01:00PM - 03:00PM\`.`);
+    return;
+  }
+
+  await createClassFromDetails(chatId, parsed);
+}
+
+async function downloadTelegramVoice(fileId) {
+  const fileResponse = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`, {
+    signal: AbortSignal.timeout(20000)
+  });
+  if (!fileResponse.ok) throw new Error(`Telegram getFile failed (${fileResponse.status}).`);
+  const filePayload = await fileResponse.json();
+  const filePath = filePayload?.result?.file_path;
+  if (filePayload?.ok !== true || !filePath) throw new Error('Telegram did not return the voice file path.');
+
+  const audioResponse = await fetch(`https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`, {
+    signal: AbortSignal.timeout(20000)
+  });
+  if (!audioResponse.ok) throw new Error(`Telegram voice download failed (${audioResponse.status}).`);
+  return Buffer.from(await audioResponse.arrayBuffer());
+}
+
+async function replyVoiceError(chatId, error) {
+  if (error.code === 'NOT_CONFIGURED') {
+    await sendTelegramMessage(chatId, '⚠️ Voice input is not configured.');
+    return;
+  }
+  if (error.code === 'RATE_LIMITED') {
+    await sendTelegramMessage(chatId, '⚠️ Voice service is busy, try again in a minute.');
+    return;
+  }
+  const referenceId = crypto.randomUUID();
+  console.error('Voice handling failed:', { referenceId, message: error.message, code: error.code });
+  await sendTelegramMessage(chatId, `⚠️ Voice processing failed. Please try again or type /create.\nReference: \`${referenceId}\``);
+}
+
+async function handleVoiceMessage(message) {
+  const chatId = message.chat.id;
+  const voiceNote = message.voice;
+
+  if (!isVoiceConfigured()) {
+    await sendTelegramMessage(chatId, '⚠️ Voice input is not configured.');
+    return;
+  }
+  if (Number(voiceNote.file_size || 0) > MAX_VOICE_FILE_BYTES) {
+    await sendTelegramMessage(chatId, '⚠️ That voice note is too large. Please keep it under 20MB.');
+    return;
+  }
+
+  let transcript;
+  try {
+    transcript = await transcribeVoice(await downloadTelegramVoice(voiceNote.file_id));
+  } catch (error) {
+    await replyVoiceError(chatId, error);
+    return;
+  }
+
+  await sendTelegramMessage(chatId, `🎙 *Heard:*\n"${transcript}"`);
+
+  if (!looksLikeCreateRequest(transcript)) {
+    await sendTelegramMessage(chatId, 'Voice received. I only turn voice into classes right now - say e.g. \'create class ...\' or type /create.');
+    return;
+  }
+
+  let extracted;
+  try {
+    extracted = await extractClasses(transcript, {
+      todayKey: formatScheduleDate(indiaDateKey(0)),
+      centers: VOICE_CENTERS,
+      courses: VOICE_COURSES
+    });
+  } catch (error) {
+    await replyVoiceError(chatId, error);
+    return;
+  }
+
+  const { valid, skipped } = validateClasses(extracted, {
+    parseDateStrToVal,
+    parseStartTimeToMinutes,
+    hasCompleteScheduleDetails
+  });
+
+  if (!valid.length) {
+    const reasons = skipped.length
+      ? skipped.map(item => `• ${item.reason}`).join('\n')
+      : '• The note did not include all six schedule fields.';
+    await sendTelegramMessage(chatId,
+      `⚠️ *I could not find a complete class in that voice note.*\n"${transcript}"\n\n${reasons}\n\n` +
+      'Send date, time, center, course, subject and faculty, or type:\n' +
+      '`/create 06 Sept 2026, 4:00 - 6:00PM, Laxmi Nagar, CLAT, Legal, Shivam Sir`');
+    return;
+  }
+
+  let draftId;
+  try {
+    draftId = await saveDraft({
+      sheets: getSheetsClient(),
+      spreadsheetId: SPREADSHEET_ID,
+      chatId,
+      userId: message.from?.id,
+      classes: valid
+    });
+  } catch (error) {
+    await replyVoiceError(chatId, error);
+    return;
+  }
+
+  const lines = valid.map((cls, index) =>
+    `${index + 1}. ${cls.date} · ${cls.time} · ${cls.center} · ${cls.course}/${cls.subject} · ${cls.faculty}`
+  );
+  const skippedLines = skipped.length
+    ? `\n\n⚠️ *Skipped:*\n${skipped.map(item => `• ${item.class.date || item.class.subject || 'Unnamed class'} — ${item.reason}`).join('\n')}`
+    : '';
+  const plural = valid.length === 1 ? 'class' : 'classes';
+  await sendTelegramMessage(chatId,
+    `✅ *I found ${valid.length} ${plural}:*\n\n${lines.join('\n')}${skippedLines}\n\nTap ✅ to create ${valid.length === 1 ? 'it' : 'all of them'}, or ❌ to cancel.`,
+    { reply_markup: buildDraftKeyboard(draftId, valid.length) }
+  );
+}
+
+async function handleDraftCallback(callbackQuery) {
+  const data = String(callbackQuery.data || '');
+  const confirmMatch = data.match(/^draft:([a-f0-9]{8})$/);
+  const cancelMatch = data.match(/^draft-cancel:([a-f0-9]{8})$/);
+  if (!confirmMatch && !cancelMatch) {
+    await answerCallbackQuery(callbackQuery.id, 'This draft action is invalid.');
+    return;
+  }
+
+  const draftId = (confirmMatch || cancelMatch)[1];
+  const chatId = callbackQuery.message?.chat?.id;
+  const classes = await takeDraft({
+    sheets: getSheetsClient(),
+    spreadsheetId: SPREADSHEET_ID,
+    chatId,
+    userId: callbackQuery.from?.id,
+    draftId
+  });
+  if (!classes) {
+    await answerCallbackQuery(callbackQuery.id, 'This draft expired or belongs to another chat.');
+    return;
+  }
+  if (cancelMatch) {
+    await answerCallbackQuery(callbackQuery.id, 'Cancelled.');
+    return;
+  }
+
+  const results = await createClassesFromDetails(chatId, classes);
+  const created = results.filter(result => result.ok).length;
+  await answerCallbackQuery(callbackQuery.id, created ? `Created ${created} class(es).` : 'No classes were created.');
 }
 
 async function handleUpdateCommand(chatId, argsStr) {
@@ -983,3 +1189,6 @@ module.exports._setTelegramCommandMenu = setTelegramCommandMenu;
 module.exports._setTelegramMenuButton = setTelegramMenuButton;
 module.exports._telegramCommands = TELEGRAM_COMMANDS;
 module.exports._isValidCronAuthorization = isValidCronAuthorization;
+module.exports._createClassFromDetails = createClassFromDetails;
+module.exports._createClassesFromDetails = createClassesFromDetails;
+module.exports._buildDraftKeyboard = buildDraftKeyboard;

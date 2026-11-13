@@ -12,12 +12,24 @@ This app provides Telegram commands for viewing and editing the shared TCR class
 - `/undo <row>` — clear `SENT` in G but keep the Zoom URL in I.
 - `/chat add <chat-id>`, `/chat remove <chat-id>`, or `/chat list` — manage authorized Telegram chats from the administrator’s private chat; IDs are stored in the `AuthorizedChats` tab of the schedule spreadsheet.
 - `/create` or `/add` — add a class using comma-separated, pipe-separated, multiline, or key-value input. It inserts a row and writes explicitly to A:H (G is left blank for the dispatch status; the Calendar `iCalUID` is stored in H). Class date/time input is treated as Asia/Kolkata (IST) when creating Calendar events.
+- Voice note (audio message) — describe one or more classes; the bot transcribes and extracts them, then creates the rows after a confirmation button. See [Voice notes](#voice-notes).
 - `/update <row> <field> <value>` — update one field, or provide a complete row. Supported fields are Date, Time, Center, Course, Subject, Faculty, and Status; changing a detail field clears G and the stored Zoom URL in I.
 - `/delete <row>` — delete its linked Calendar event from column H, then delete the schedule row. If deleting the Calendar event fails, the row is retained.
 
 `/preview` buttons carry a short signature over the group and its rows. If the sheet changes between sending the preview and tapping a button, the callback is rejected with “This preview is out of date. Run /preview again.”
 
 `/start` and `/help` register Telegram's command menu, which includes `/help`. Command failures are reported in the chat with a safe error summary and a reference ID for Vercel logs. If Calendar event creation fails, `/create` reports that it saved the row without the event. Deleting a row directly in Google Sheets does not run bot cleanup; use `/delete` when the linked Calendar event should also be removed.
+
+## Voice notes
+
+Send an audio message instead of typing `/create`. The bot downloads the Telegram voice file, transcribes it with Groq (`whisper-large-v3-turbo`), and asks the extraction model (`openai/gpt-oss-20b`) for one object per class described, so a single voice note can create several classes.
+
+1. The transcript is always echoed back to the chat.
+2. Every extracted class is trimmed and validated with the same date/time parsers as `/create`; it must carry date, time, center, course, subject, and faculty. Incomplete classes are listed as skipped, with the reason.
+3. If at least one class is complete, a preview lists the classes to create and stores a one-time draft in the spreadsheet's `Drafts` tab (header `Draft ID | Chat ID | User ID | Expires At | Payload`). Tapping **✅ Create N class(es)** inserts the rows in chronological order and replies with one summary; **❌ Cancel** consumes the draft without creating anything.
+4. Drafts belong to the chat and user that created them, are single-use, and expire after 30 minutes. Voice files larger than 20MB are rejected. Without `GROQ_API_KEY` the bot replies that voice input is not configured; text commands keep working.
+
+Audio is uploaded to Groq for transcription, so it leaves this system — do not send voice notes containing information that must stay inside the deployment's trust boundary. The configured free-tier limits are `whisper-large-v3-turbo`: 7,200 audio-seconds per hour and 28,800 per day, and `openai/gpt-oss-20b`: 1,000 requests per day. Rate-limited requests are reported as "Voice service is busy, try again in a minute."
 
 ## Vercel configuration
 
@@ -35,6 +47,7 @@ Deploy this directory as the Vercel project's **Root Directory**. Configure thes
 | `ZOOM_CLIENT_ID` | Yes for Zoom links | Zoom Server-to-Server OAuth client ID. |
 | `ZOOM_CLIENT_SECRET` | Yes for Zoom links | Zoom Server-to-Server OAuth client secret. |
 | `CRON_SECRET` | Yes | Bearer token used to authenticate Vercel's scheduled `/api/cron` request. |
+| `GROQ_API_KEY` | No | Groq API key for voice notes (speech-to-text and class extraction). Without it voice messages are refused with a configuration message; text commands are unaffected. |
 
 Share the spreadsheet with the service account email as an Editor. If calendar event creation is required, enable the Google Calendar API and share the target calendar with that service account with permission to make changes to events. Enable the Google Sheets API in the service account's Google Cloud project as well.
 
@@ -59,7 +72,7 @@ npm ci
 npm test
 ```
 
-The tests exercise schedule parsing, filtering, insertion ordering, configuration validation, webhook-secret and cron-auth checks, Zoom start-time/sync behavior, preview grouping and keyboard construction, chat-ID normalization, and the health endpoint without modifying the live spreadsheet or sending Telegram messages.
+The tests exercise schedule parsing, filtering, insertion ordering, configuration validation, webhook-secret and cron-auth checks, Zoom start-time/sync behavior, preview grouping and keyboard construction, chat-ID normalization, voice transcription/extraction/validation (with stubbed fetch calls), one-time Drafts handling, and the health endpoint without modifying the live spreadsheet or sending Telegram messages.
 
 The old create path used Sheets `values.append`, which could place a newly-created record to the right of the schedule table. The explicit insert-and-write path prevents future row shifts; it does not automatically repair an entry created by the old behavior. Back up the sheet and move that entry's six class fields into A:F, leaving G empty and preserving its verified Calendar event ID in H.
 

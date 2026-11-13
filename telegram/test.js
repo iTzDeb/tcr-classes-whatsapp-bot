@@ -3,6 +3,8 @@ const telegramWebhook = require('./api/index');
 const preview = require('./lib/preview');
 const { formatZoomStartTime, getZoomDurationMins, extractZoomMeetingId, syncZoomMeeting } = require('./lib/zoom');
 const chatAccess = require('./lib/chatAccess');
+const voice = require('./lib/voice');
+const drafts = require('./lib/drafts');
 
 const {
   _getMissingConfiguration: getMissingConfiguration,
@@ -110,7 +112,7 @@ async function testSyncExistingZoomMeetingsSyncsEveryStoredMeeting() {
       : { ok: true, json: async () => ({}) };
   };
   try {
-    await syncExistingZoomMeetings([
+    const failures = await syncExistingZoomMeetings([
       {
         rowIndex: 7, date: '05 Nov 2026', time: '04:00PM - 06:00PM',
         center: 'Laxmi Nagar', course: 'CLAT', subject: 'Legal', faculty: 'Shivam Sir',
@@ -131,12 +133,58 @@ async function testSyncExistingZoomMeetingsSyncsEveryStoredMeeting() {
       ],
       'Each row must update its own stored Zoom meeting'
     );
+    assert.deepStrictEqual(failures, [], 'A successful refresh must report no failures');
   } finally {
     for (const [name, value] of Object.entries(env)) {
       if (value === undefined) delete process.env[name];
       else process.env[name] = value;
     }
   }
+}
+
+async function testSyncExistingZoomMeetingsReportsFailures() {
+  const calls = [];
+  const env = {
+    ZOOM_ACCOUNT_ID: process.env.ZOOM_ACCOUNT_ID,
+    ZOOM_CLIENT_ID: process.env.ZOOM_CLIENT_ID,
+    ZOOM_CLIENT_SECRET: process.env.ZOOM_CLIENT_SECRET
+  };
+  process.env.ZOOM_ACCOUNT_ID = 'account';
+  process.env.ZOOM_CLIENT_ID = 'client';
+  process.env.ZOOM_CLIENT_SECRET = 'secret';
+  const fetchImpl = async (url, options) => {
+    calls.push({ url, options });
+    return url.includes('/oauth/token')
+      ? { ok: true, json: async () => ({ access_token: 'access-token' }) }
+      : { ok: false, status: 404, json: async () => ({ code: 2300, message: 'This API endpoint is not recognized.' }) };
+  };
+  try {
+    const failures = await syncExistingZoomMeetings([{
+      rowIndex: 7, date: '05 Nov 2026', time: '04:00PM - 06:00PM',
+      center: 'Laxmi Nagar', course: 'CLAT', subject: 'Legal', faculty: 'Shivam Sir',
+      zoomUrl: 'https://zoom.us/j/123456789'
+    }], fetchImpl);
+    assert.strictEqual(failures.length, 1, 'A failed Zoom refresh must resolve with one failure entry, not reject');
+    assert.strictEqual(failures[0].rowIndex, 7);
+    assert.match(
+      failures[0].message,
+      /row 7 \(HTTP 404, code 2300, meeting 123456789\)/,
+      'The failure message must name the row, HTTP status, Zoom code, and meeting ID'
+    );
+    assert.strictEqual(calls.length, 2, 'The failed meeting should still have been attempted');
+  } finally {
+    for (const [name, value] of Object.entries(env)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
+
+async function testZoomEnvSuite() {
+  await testZoomMeetingSyncUsesCurrentSchedule();
+  await testSyncExistingZoomMeetingsSyncsEveryStoredMeeting();
+  await testSyncExistingZoomMeetingsReportsFailures();
+  await testSyncExistingZoomMeetingsSkipsRowsWithoutPendingZoom();
 }
 
 async function testSyncExistingZoomMeetingsSkipsRowsWithoutPendingZoom() {
@@ -700,15 +748,271 @@ async function testOperationalGuards() {
   }
 }
 
+async function testVoiceTranscription() {
+  const originalKey = process.env.GROQ_API_KEY;
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    calls.push({ url, options });
+    return { ok: true, status: 200, json: async () => ({ text: '  create class tomorrow  ' }) };
+  };
+  try {
+    delete process.env.GROQ_API_KEY;
+    assert.strictEqual(voice.isVoiceConfigured(), false, 'Voice must report unconfigured without GROQ_API_KEY');
+    await assert.rejects(
+      () => voice.transcribeVoice(Buffer.from('audio'), { fetchImpl }),
+      error => error.code === 'NOT_CONFIGURED',
+      'A missing GROQ_API_KEY must surface as NOT_CONFIGURED'
+    );
+    assert.strictEqual(calls.length, 0, 'No request must be sent without an API key');
+
+    process.env.GROQ_API_KEY = 'test-groq-key';
+    assert.strictEqual(voice.isVoiceConfigured(), true);
+    const transcript = await voice.transcribeVoice(Buffer.from('audio-bytes'), { mimeType: 'audio/ogg', fetchImpl });
+    assert.strictEqual(transcript, 'create class tomorrow', 'The transcript should be trimmed');
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0].url, 'https://api.groq.com/openai/v1/audio/transcriptions');
+    assert.strictEqual(calls[0].options.method, 'POST');
+    assert.strictEqual(calls[0].options.headers.Authorization, 'Bearer test-groq-key');
+    assert.ok(calls[0].options.body instanceof FormData, 'Transcription must use multipart form data');
+    assert.strictEqual(calls[0].options.body.get('model'), 'whisper-large-v3-turbo');
+    const uploadedFile = calls[0].options.body.get('file');
+    assert.strictEqual(uploadedFile.name, 'voice.ogg');
+    assert.strictEqual(uploadedFile.type, 'audio/ogg');
+    assert.ok(calls[0].options.signal instanceof AbortSignal, 'The request must carry a timeout signal');
+
+    const rateLimited = async () => ({ ok: false, status: 429, json: async () => ({}) });
+    await assert.rejects(
+      () => voice.transcribeVoice(Buffer.from('audio'), { fetchImpl: rateLimited }),
+      error => error.code === 'RATE_LIMITED',
+      'HTTP 429 must surface as RATE_LIMITED'
+    );
+
+    const emptySpeech = async () => ({ ok: true, status: 200, json: async () => ({ text: '   ' }) });
+    await assert.rejects(
+      () => voice.transcribeVoice(Buffer.from('audio'), { fetchImpl: emptySpeech }),
+      error => error.code === 'TRANSCRIBE_FAILED',
+      'An empty transcript must surface as TRANSCRIBE_FAILED'
+    );
+  } finally {
+    if (originalKey === undefined) delete process.env.GROQ_API_KEY;
+    else process.env.GROQ_API_KEY = originalKey;
+  }
+}
+
+async function testVoiceClassExtraction() {
+  const originalKey = process.env.GROQ_API_KEY;
+  process.env.GROQ_API_KEY = 'test-groq-key';
+  const calls = [];
+  const extractionResponse = classes => ({
+    choices: [{ message: { content: JSON.stringify({ classes }) } }]
+  });
+  const twoClasses = [
+    { date: '06 Sept 2026', time: '4:00 - 6:00PM', center: 'Laxmi Nagar', course: 'CLAT', subject: 'Legal', faculty: 'Shivam Sir' },
+    { date: '07 Sept 2026', time: '6:00 - 8:00PM', center: 'Hauz Khas', course: 'CUET', subject: 'English', faculty: 'Anand Sir' }
+  ];
+  try {
+    const fetchImpl = async (url, options) => {
+      calls.push({ url, body: JSON.parse(options.body) });
+      return { ok: true, status: 200, json: async () => extractionResponse(twoClasses) };
+    };
+    const extracted = await voice.extractClasses('do classes on 6th and 7th', {
+      todayKey: '13 Nov 2026',
+      centers: ['Laxmi Nagar', 'Hauz Khas'],
+      courses: ['CLAT'],
+      fetchImpl
+    });
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0].url, 'https://api.groq.com/openai/v1/chat/completions');
+    assert.strictEqual(calls[0].body.model, 'openai/gpt-oss-20b');
+    assert.strictEqual(calls[0].body.temperature, 0);
+    assert.strictEqual(calls[0].body.response_format.type, 'json_schema');
+    const schema = calls[0].body.response_format.json_schema.schema;
+    assert.strictEqual(schema.properties.classes.minItems, 1);
+    assert.strictEqual(schema.properties.classes.maxItems, 10);
+    assert.deepStrictEqual(schema.properties.classes.items.required.slice().sort(), ['center', 'course', 'date', 'faculty', 'subject', 'time']);
+    assert.match(calls[0].body.messages[0].content, /13 Nov 2026/, 'The prompt must carry the caller-provided today key');
+    assert.match(calls[0].body.messages[0].content, /Laxmi Nagar/, 'The prompt must carry the allowed centers');
+    assert.deepStrictEqual(extracted.classes.map(cls => cls.date), ['06 Sept 2026', '07 Sept 2026']);
+    assert.strictEqual(extracted.classes[1].faculty, 'Anand Sir');
+
+    calls.length = 0;
+    const fallbackFetch = async (url, options) => {
+      calls.push({ url, body: JSON.parse(options.body) });
+      if (calls.length === 1) return { ok: false, status: 400, json: async () => ({ error: 'json_schema unsupported' }) };
+      return { ok: true, status: 200, json: async () => extractionResponse([twoClasses[0]]) };
+    };
+    const fallback = await voice.extractClasses('one class', { todayKey: '13 Nov 2026', fetchImpl: fallbackFetch });
+    assert.strictEqual(calls.length, 2, 'A rejected json_schema response must be retried once');
+    assert.deepStrictEqual(calls[1].body.response_format, { type: 'json_object' });
+    assert.strictEqual(fallback.classes.length, 1);
+
+    const fencedJson = async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ choices: [{ message: { content: '```json\n{"classes":[{"date":"06 Sept 2026","time":"4:00 - 6:00PM","center":"Laxmi Nagar","course":"CLAT","subject":"Legal","faculty":"Shivam Sir"}]}\n```' } }] })
+    });
+    const fenced = await voice.extractClasses('fenced', { todayKey: '13 Nov 2026', fetchImpl: fencedJson });
+    assert.strictEqual(fenced.classes.length, 1, 'Fenced JSON should be parsed tolerantly');
+
+    const malformed = async () => ({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: 'not json at all' } }] }) });
+    await assert.rejects(
+      () => voice.extractClasses('bad', { todayKey: '13 Nov 2026', fetchImpl: malformed }),
+      error => error.code === 'EXTRACT_FAILED',
+      'Malformed model output must surface as EXTRACT_FAILED'
+    );
+
+    const failing = async () => ({ ok: false, status: 500, json: async () => ({}) });
+    await assert.rejects(
+      () => voice.extractClasses('down', { todayKey: '13 Nov 2026', fetchImpl: failing }),
+      error => error.code === 'EXTRACT_FAILED',
+      'A failing extraction service must surface as EXTRACT_FAILED'
+    );
+  } finally {
+    if (originalKey === undefined) delete process.env.GROQ_API_KEY;
+    else process.env.GROQ_API_KEY = originalKey;
+  }
+}
+
+async function testVoiceProviders() {
+  await testVoiceTranscription();
+  await testVoiceClassExtraction();
+}
+
+function testVoiceValidateClasses() {
+  const spoken = {
+    classes: [
+      { date: '06 Sept 2026', time: '4:00 - 6:00PM', center: 'Laxmi Nagar', course: 'CLAT', subject: 'Legal', faculty: 'Shivam Sir' },
+      { date: '07 Sept 2026', time: '6:00 - 8:00PM', center: 'Hauz Khas', course: 'CUET', subject: 'English', faculty: 'Anand Sir' },
+      { date: '08 Sept 2026', time: '4:00 - 6:00PM', center: 'Laxmi Nagar', course: 'CLAT', subject: 'Legal', faculty: '   ' }
+    ]
+  };
+  const deps = { parseDateStrToVal, parseStartTimeToMinutes, hasCompleteScheduleDetails };
+  const { valid, skipped } = voice.validateClasses(spoken, deps);
+  assert.strictEqual(valid.length, 2, 'Only complete classes should be kept');
+  assert.strictEqual(skipped.length, 1, 'Incomplete classes should be reported as skipped');
+  assert.match(skipped[0].reason, /faculty/, 'The skip reason should name the missing field');
+  assert.strictEqual(skipped[0].class.faculty, '', 'Skipped classes should be trimmed strings');
+
+  const kept = voice.validateClasses({ classes: [{
+    date: '06 Sept 2026', time: '4 to 6 pm', center: 'Laxmi Nagar', course: 'CLAT', subject: 'Legal', faculty: 'Shivam Sir'
+  }] }, deps);
+  assert.strictEqual(kept.valid.length, 1, 'A spoken-format time that the app can parse must be accepted');
+  assert.strictEqual(kept.valid[0].time, '4 to 6 pm', 'The spoken time string must be preserved for the sheet');
+
+  const unresolved = voice.validateClasses({ classes: [{
+    date: 'tomorrow', time: '4 to 6 pm', center: 'Laxmi Nagar', course: 'CLAT', subject: 'Legal', faculty: 'Shivam Sir'
+  }] }, deps);
+  assert.strictEqual(unresolved.valid.length, 0, 'An unparseable date must be skipped');
+  assert.match(unresolved.skipped[0].reason, /date/, 'The skip reason should mention the date');
+
+  assert.deepStrictEqual(voice.validateClasses({}).valid, [], 'An empty extraction should yield no valid classes');
+}
+
+function testLooksLikeCreateRequest() {
+  for (const transcript of [
+    'Create a class tomorrow at four',
+    'add one lecture for CLAT',
+    'schedule a session on 6 Sept',
+    'please add another batch',
+    'क्लास शेड्यूल करो',
+    'नई क्लास जोड़ो'
+  ]) {
+    assert.strictEqual(voice.looksLikeCreateRequest(transcript), true, `Should look like a create request: ${transcript}`);
+  }
+  for (const transcript of ['hello', 'what is the weather today', 'thanks', '']) {
+    assert.strictEqual(voice.looksLikeCreateRequest(transcript), false, `Should not look like a create request: ${transcript}`);
+  }
+}
+
+function createDraftsSheets() {
+  let exists = false;
+  const rows = [];
+  const sheets = { spreadsheets: {
+    get: async () => ({ data: { sheets: exists ? [{ properties: { title: 'Drafts', sheetId: 22 } }] : [] } }),
+    batchUpdate: async ({ requestBody }) => {
+      if (requestBody.requests[0].addSheet) {
+        exists = true;
+        return { data: { replies: [{ addSheet: { properties: { title: 'Drafts', sheetId: 22 } } }] } };
+      }
+      for (const request of requestBody.requests) {
+        const range = request.deleteDimension.range;
+        rows.splice(range.startIndex, range.endIndex - range.startIndex);
+      }
+      return { data: {} };
+    },
+    values: {
+      update: async ({ requestBody }) => { rows.splice(0, rows.length, ...requestBody.values.map(row => [...row])); return { data: {} }; },
+      append: async ({ requestBody }) => { rows.push(...requestBody.values.map(row => [...row])); return { data: {} }; },
+      get: async () => ({ data: { values: rows.map(row => [...row]) } })
+    }
+  } };
+  return { sheets, rows };
+}
+
+async function testDraftsFlow() {
+  const { sheets, rows } = createDraftsSheets();
+  const options = { sheets, spreadsheetId: 'sheet' };
+  const classes = [{
+    date: '06 Sept 2026', time: '4:00 - 6:00PM', center: 'Laxmi Nagar',
+    course: 'CLAT', subject: 'Legal', faculty: 'Shivam Sir'
+  }];
+
+  const before = Date.now();
+  const draftId = await drafts.saveDraft({ ...options, chatId: '12345', userId: '77', classes });
+  assert.match(draftId, /^[a-f0-9]{8}$/, 'A draft ID must be 8 lowercase hex characters');
+  assert.deepStrictEqual(rows[0], ['Draft ID', 'Chat ID', 'User ID', 'Expires At', 'Payload'],
+    'The Drafts tab must carry the documented header row');
+  const expiry = Date.parse(rows[1][3]);
+  assert.ok(expiry >= before + 29 * 60 * 1000 && expiry <= Date.now() + 30 * 60 * 1000,
+    'A draft should expire 30 minutes after it is saved');
+  assert.deepStrictEqual(JSON.parse(rows[1][4]), classes, 'The payload must store the parsed classes');
+
+  assert.strictEqual(await drafts.takeDraft({ ...options, chatId: '999', userId: '77', draftId }), null,
+    'Another chat must not consume the draft');
+  assert.strictEqual(rows.length, 2, 'A rejected take must leave the draft row in place');
+  assert.strictEqual(await drafts.takeDraft({ ...options, chatId: '12345', userId: '88', draftId }), null,
+    'Another user must not consume the draft');
+
+  assert.deepStrictEqual(await drafts.takeDraft({ ...options, chatId: '12345', userId: '77', draftId }), classes,
+    'The owning chat should receive the stored classes');
+  assert.strictEqual(rows.length, 1, 'Taking a draft must delete its row');
+  assert.strictEqual(await drafts.takeDraft({ ...options, chatId: '12345', userId: '77', draftId }), null,
+    'A draft is single-use');
+
+  await drafts.saveDraft({ ...options, chatId: '12345', userId: '77', classes });
+  rows[1][3] = new Date(Date.now() - 60 * 1000).toISOString();
+  await drafts.deleteExpiredDrafts(options);
+  assert.strictEqual(rows.length, 1, 'Expired drafts should be removed from the tab');
+
+  await drafts.deleteExpiredDrafts({
+    sheets: { spreadsheets: { get: async () => { throw new Error('Sheets unavailable'); } } },
+    spreadsheetId: 'sheet'
+  }); // Cleanup must stay best-effort and never throw to the caller.
+}
+
+function testDraftKeyboardCallbackData() {
+  const keyboard = telegramWebhook._buildDraftKeyboard('abcdef12', 3);
+  const buttons = keyboard.inline_keyboard.flat();
+  assert.deepStrictEqual(buttons.map(button => button.callback_data), ['draft:abcdef12', 'draft-cancel:abcdef12']);
+  buttons.forEach(button => assert.ok(
+    Buffer.byteLength(button.callback_data, 'utf8') <= 64,
+    `Callback data must fit Telegram's 64-byte limit: ${button.callback_data}`
+  ));
+  assert.match(buttons[0].text, /3/, 'The create button should name how many classes will be created');
+}
+
 Promise.all([
   testHealthEndpoint(),
   testOperationalGuards(),
   testExplicitScheduleRowWrite(),
   testCalendarAndRowDeletion(),
-  testZoomMeetingSyncUsesCurrentSchedule(),
-  testSyncExistingZoomMeetingsSyncsEveryStoredMeeting(),
-  testSyncExistingZoomMeetingsSkipsRowsWithoutPendingZoom(),
-  testChatAccess()
+  testZoomEnvSuite(),
+  testChatAccess(),
+  testVoiceProviders(),
+  testVoiceValidateClasses(),
+  testLooksLikeCreateRequest(),
+  testDraftsFlow(),
+  testDraftKeyboardCallbackData()
 ])
   .then(() => console.log('All Telegram schedule bot tests passed successfully!'))
   .catch(error => {

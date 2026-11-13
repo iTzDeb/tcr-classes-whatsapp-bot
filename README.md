@@ -68,6 +68,8 @@ The schedule tab is named **`Schedule`**. Rows begin at row 2; row 1 is the head
 
 The **`Settings`** tab contains rows mapping Center (A), Course (B), and one or more comma-separated WhatsApp group JIDs (C). The key is normalized by the dispatcher to `center_course`, e.g. `laxmi nagar_gs foundation`. Verify spelling and JIDs carefully: a missing mapping prevents delivery for that group.
 
+The Telegram bot also maintains its own tabs in the same spreadsheet: `AuthorizedChats` (one chat ID below the `Chat ID` header in A1) and `Drafts` (voice-note drafts with header `Draft ID | Chat ID | User ID | Expires At | Payload`). Draft rows are temporary: they are single-use, belong to the chat and user that created them, and expire after 30 minutes, after which they are cleaned up opportunistically.
+
 The Vercel Telegram app writes schedule rows directly through the Google Sheets API. Those API edits **do not fire Apps Script `onEdit` triggers**. If new Telegram-created rows need calendar synchronization, use a time-driven GAS reconciliation or have the Telegram app perform calendar sync (the current `/create` path attempts the latter). `autoTriggerCalendarSync(e)` only runs for human edits when installed as an edit trigger.
 
 ## 4. Data ownership and operational rules
@@ -91,6 +93,7 @@ The Vercel Telegram app writes schedule rows directly through the Google Sheets 
 | `/list <date or text>` | Filter by a date, center, course, subject, faculty, or keyword. Month names may be spelled out (`/list 4 October`, `/list October`). |
 | `/preview` | Prepare only complete, unsent classes scheduled for **tomorrow**. Headings identify Laxmi Nagar as `(LN)` and Hauz Khas as `(HK)` (center names are matched case-insensitively, tolerating a trailing `Centre`/`Center`/`Campus`). Zoom links are generated/refreshed only for eligible Laxmi Nagar classes. One message is sent per date/center/course group with inline buttons: `📤 Open WhatsApp (no Zoom)` (message formatted without Zoom lines — for groups that must not receive links), `🎥 Generate Zoom & Prepare Send` (when a Zoom link is still missing), and once links are ready `📤 Open WhatsApp (with Zoom)` alongside the no-Zoom variant and `✅ Mark as sent`. Generating Zoom sends the updated message back to **the chat that tapped the button**, not to `AUTHORIZED_CHAT_ID`. Button callbacks are signed; a preview whose rows changed since sending is rejected as out of date. |
 | `/create <class details>` or `/add <class details>` | Add a complete row in chronological order using an explicit A:H range, leaving G empty and storing the Calendar `iCalUID` in H. The entered class date/time is interpreted as Asia/Kolkata (IST) for Calendar creation. |
+| Voice note (audio message) | Describe one or more classes in a voice note. The bot transcribes it with Groq, extracts one class per class described, shows a numbered preview (with skipped items and reasons), and stores a one-time draft. Tapping **✅ Create N class(es)** creates every valid class in chronological order and replies with one summary; **❌ Cancel** discards the draft. See [Voice notes](#voice-notes). |
 | `/update <row> <field> <value>` | Update one field. Supported fields: Date, Time, Center, Course, Subject, Faculty, Status. Changing a detail field clears G and the stored Zoom URL in I. |
 | `/update <row> <full row>` | Update A–G for a complete class. It clears G and I and leaves H untouched. Review calendar consistency after changing class date/time/details. |
 | `/resend <row>` | Clear G (status) and I (Zoom URL) so the row can be re-prepared by `/preview`. |
@@ -105,6 +108,18 @@ The `/check` smoke test described in earlier revisions no longer exists: the com
 The Telegram `/start` and `/help` commands also register the Telegram command menu, including `/help`, using Bot API `setMyCommands` and `setChatMenuButton`. Command failures are reported in the chat with a safe error summary and a reference ID for matching Vercel function logs. If Calendar creation fails during `/create`, the bot clearly reports that the schedule row was saved without an event. Calendar/Sheets failures during `/delete` stop the deletion when the event could not be removed, to avoid leaving an orphaned event.
 
 `/preview` is also triggered by the daily Vercel cron (`GET /api/cron`, 10:58 UTC / 16:28 IST by default in `telegram/vercel.json`), which authenticates with `Authorization: Bearer <CRON_SECRET>` and sends its output to `AUTHORIZED_CHAT_ID`. The checked-in app has **no** `/reauth` command and reads no `RENDER_*` environment variables; WhatsApp relinking is done against the Render service directly (see §7).
+
+### Voice notes
+
+Authorized chats can send an audio message instead of typing `/create`. The webhook:
+
+1. Downloads the Telegram voice file and rejects anything larger than 20MB.
+2. Transcribes it with Groq `whisper-large-v3-turbo` and echoes the transcript back to the chat.
+3. Asks `openai/gpt-oss-20b` for one object per class, so a single voice note can describe several classes.
+4. Validates every class with the same date/time parsers as `/create` and requires date, time, center, course, subject, and faculty. Incomplete classes are listed as skipped with the reason.
+5. Stores a one-time draft in the `Drafts` tab and shows a numbered preview with **✅ Create N class(es)** / **❌ Cancel** buttons. Creation runs sequentially so rows stay in chronological order, and the batch produces one summary reply; a single failed class does not abort the rest.
+
+Drafts are bound to the originating chat and user, are single-use, and expire after 30 minutes. Without `GROQ_API_KEY` the bot replies "Voice input is not configured." and text commands keep working. Audio is uploaded to Groq for transcription, so it leaves this system — do not send voice notes containing data that must stay inside the deployment's trust boundary. The configured free-tier limits are `whisper-large-v3-turbo`: 7,200 audio-seconds per hour and 28,800 per day, and `openai/gpt-oss-20b`: 1,000 requests per day; rate-limited requests are reported as "Voice service is busy, try again in a minute."
 
 **Important:** deleting a row directly in Google Sheets does not call the Telegram bot and cannot automatically remove its Calendar event. Use Telegram `/delete <row>` for linked cleanup. Before deleting a row, check that its row number is current and that H contains the intended event identifier.
 
@@ -136,8 +151,9 @@ Set values in **Vercel Project → Settings → Environment Variables**, not in 
 | `ZOOM_ACCOUNT_ID` | Yes for Zoom links | Zoom Server-to-Server OAuth account ID. Without Zoom configuration, `/preview` cannot generate links for Laxmi Nagar classes. |
 | `ZOOM_CLIENT_ID` | Yes for Zoom links | Zoom Server-to-Server OAuth client ID. |
 | `ZOOM_CLIENT_SECRET` | Yes for Zoom links | Zoom Server-to-Server OAuth client secret. |
+| `GROQ_API_KEY` | No | Groq API key for voice notes: `whisper-large-v3-turbo` for speech-to-text and `openai/gpt-oss-20b` for class extraction. Optional; without it, voice messages are refused with a configuration message and text commands are unaffected. |
 
-A webhook POST is rejected with HTTP 500 and `missingEnvironmentVariables` unless all five of `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `AUTHORIZED_CHAT_ID`, `SPREADSHEET_ID`, and `GOOGLE_SERVICE_ACCOUNT_KEY` are non-empty. `ZOOM_*` and `CRON_SECRET` are not part of that check, so a missing Zoom secret fails at `/preview` time, and a missing `CRON_SECRET` fails only the cron endpoint.
+A webhook POST is rejected with HTTP 500 and `missingEnvironmentVariables` unless all five of `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `AUTHORIZED_CHAT_ID`, `SPREADSHEET_ID`, and `GOOGLE_SERVICE_ACCOUNT_KEY` are non-empty. `ZOOM_*`, `GROQ_API_KEY`, and `CRON_SECRET` are not part of that check, so a missing Zoom secret fails at `/preview` time, voice notes are refused when Groq is not configured, and a missing `CRON_SECRET` fails only the cron endpoint.
 
 The code rejects POST requests with missing configuration or an invalid Telegram secret. The production endpoint must be reachable by Telegram. If Vercel Deployment Protection is enabled for the webhook URL, use Vercel’s documented automation-bypass mechanism and include the bypass query parameter in Telegram’s configured webhook URL; **do not paste the bypass secret into this README or a public issue**. The Telegram-specific secret check remains required even when Vercel protection is configured.
 
@@ -163,7 +179,7 @@ npm ci
 npm test
 ```
 
-The tests cover parsing, filtering, insertion order, configuration validation, and webhook-secret checks; they do not write to live Google services or send messages.
+The tests cover parsing, filtering, insertion order, configuration validation, webhook-secret and cron-auth checks, Zoom sync and failure reporting, voice transcription/extraction/validation with stubbed fetch calls, one-time Drafts handling, and callback-data limits; they do not write to live Google services or send messages.
 
 ### Configure/recover Telegram’s webhook
 
