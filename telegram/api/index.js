@@ -6,6 +6,7 @@ const {
   prepareZoomSend,
   sendTelegramMessage,
   answerCallbackQuery,
+  fetchPendingRows,
   fetchAllRows,
   groupPendingRows,
   callbackSignature,
